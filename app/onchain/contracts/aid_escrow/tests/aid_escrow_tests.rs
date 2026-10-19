@@ -59,6 +59,7 @@ impl TestSetup {
             min_amount: 1, // Minimum 1 stroop
             max_expires_in: 0,
             allowed_tokens: Vec::new(&env),
+            claim_cooldown: 0,
         });
 
         Self {
@@ -152,6 +153,7 @@ mod create_package {
             min_amount: TWO_TOKENS, // Min 2.0 tokens
             max_expires_in: 0,
             allowed_tokens: Vec::new(&t.env),
+            claim_cooldown: 0,
         });
         let result = t.client.try_create_package(
             &t.admin,
@@ -239,6 +241,7 @@ mod token_interactions {
             min_amount: 1,
             max_expires_in: 0,
             allowed_tokens,
+            claim_cooldown: 0,
         });
 
         assert_eq!(result, Err(Ok(Error::InvalidToken)));
@@ -793,5 +796,374 @@ mod token_allowlist {
             &Map::new(&t.env),
         );
         assert_eq!(result, Err(Ok(Error::InvalidState)));
+    }
+}
+
+// ===========================================================================
+// sweep_expired_packages — Sweep Expired Packages and Release Locked Funds
+// ===========================================================================
+
+mod sweep_expired_packages {
+    use super::*;
+
+    fn create_package(t: &TestSetup, id: u64, recipient: &Address, amount: i128, expires_at: u64) {
+        t.fund_contract(amount);
+        t.client.create_package(
+            &t.admin,
+            &id,
+            recipient,
+            &amount,
+            &t.token,
+            &expires_at,
+            &Map::new(&t.env),
+        );
+    }
+
+    #[test]
+    fn sweep_transitions_expired_packages_and_corrects_locked_and_aggregates() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let now = t.now();
+
+        // Package 1 and 2 expire soon; package 3 is claimed before expiry;
+        // package 4 never expires.
+        create_package(&t, 1, &recipient, ONE_TOKEN, now + 100);
+        create_package(&t, 2, &recipient, ONE_TOKEN, now + 100);
+        create_package(&t, 3, &recipient, TWO_TOKENS, now + 100);
+        create_package(&t, 4, &recipient, ONE_TOKEN, 0);
+
+        t.client.claim(&3);
+
+        // Before the sweep: the claimed package is unlocked, the rest locked.
+        assert_eq!(t.client.get_total_locked(&t.token), 3 * ONE_TOKEN);
+        let agg_before = t.client.get_aggregates(&t.token);
+        assert_eq!(agg_before.total_committed, 3 * ONE_TOKEN); // pkgs 1, 2, 4
+        assert_eq!(agg_before.total_claimed, TWO_TOKENS); // pkg 3
+        assert_eq!(agg_before.total_expired_cancelled, 0);
+
+        // Advance past expiry of packages 1 and 2.
+        t.advance_time(101);
+
+        // Sweep callable by any address (no auth required).
+        let swept = t.client.sweep_expired_packages(&10);
+        assert_eq!(swept, 2);
+
+        // Swept packages are terminal.
+        assert_eq!(t.client.get_package(&1).status, PackageStatus::Expired);
+        assert_eq!(t.client.get_package(&2).status, PackageStatus::Expired);
+
+        // Locked funds are released: only the never-expiring package remains.
+        assert_eq!(t.client.get_total_locked(&t.token), ONE_TOKEN);
+
+        // Aggregates self-correct: expired packages move out of committed.
+        let agg_after = t.client.get_aggregates(&t.token);
+        assert_eq!(agg_after.total_committed, ONE_TOKEN); // pkg 4
+        assert_eq!(agg_after.total_claimed, TWO_TOKENS); // pkg 3
+        assert_eq!(agg_after.total_expired_cancelled, TWO_TOKENS); // pkgs 1, 2
+
+        // Claimed and never-expiring packages are untouched.
+        assert_eq!(t.client.get_package(&3).status, PackageStatus::Claimed);
+        assert_eq!(t.client.get_package(&4).status, PackageStatus::Created);
+    }
+
+    #[test]
+    fn sweep_is_bounded_idempotent_and_callable_by_any_address() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let now = t.now();
+
+        for i in 0..5 {
+            create_package(&t, i + 1, &recipient, ONE_TOKEN, now + 100);
+        }
+
+        assert_eq!(t.client.get_total_locked(&t.token), 5 * ONE_TOKEN);
+        t.advance_time(101);
+
+        // Sweep in bounded batches of 1 (callable by any address, no auth).
+        assert_eq!(t.client.sweep_expired_packages(&1), 1);
+        assert_eq!(t.client.get_total_locked(&t.token), 4 * ONE_TOKEN);
+        assert_eq!(t.client.sweep_expired_packages(&1), 1);
+        assert_eq!(t.client.get_total_locked(&t.token), 3 * ONE_TOKEN);
+        assert_eq!(t.client.sweep_expired_packages(&10), 3);
+        assert_eq!(t.client.get_total_locked(&t.token), 0);
+
+        // Idempotent: a repeated sweep returns 0 and changes nothing.
+        assert_eq!(t.client.sweep_expired_packages(&10), 0);
+        assert_eq!(t.client.get_total_locked(&t.token), 0);
+        for i in 0..5 {
+            assert_eq!(
+                t.client.get_package(&(i + 1)).status,
+                PackageStatus::Expired
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_skips_packages_at_exact_expiry_boundary() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let now = t.now();
+
+        create_package(&t, 1, &recipient, ONE_TOKEN, now + 100);
+        create_package(&t, 2, &recipient, ONE_TOKEN, 0);
+
+        // At the exact expiry boundary the package is still claimable, so the
+        // sweep must leave it alone.
+        t.advance_time(100);
+        assert_eq!(t.client.sweep_expired_packages(&10), 0);
+        assert_eq!(t.client.get_package(&1).status, PackageStatus::Created);
+        assert_eq!(t.client.get_total_locked(&t.token), 2 * ONE_TOKEN);
+
+        // One second later it is expired and swept.
+        t.advance_time(1);
+        assert_eq!(t.client.sweep_expired_packages(&10), 1);
+        assert_eq!(t.client.get_package(&1).status, PackageStatus::Expired);
+        assert_eq!(t.client.get_package(&2).status, PackageStatus::Created);
+        assert_eq!(t.client.get_total_locked(&t.token), ONE_TOKEN);
+    }
+}
+
+// ===========================================================================
+// Evidence Hash Tests
+// ===========================================================================
+
+mod evidence_hash {
+    use super::*;
+
+    fn valid_evidence_hash(env: &Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(
+            env,
+            "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
+        )
+    }
+
+    fn another_valid_evidence_hash(env: &Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(
+            env,
+            "fedcba09876543210fedcba09876543210fedcba09876543210fedcba0987654321",
+        )
+    }
+
+    #[test]
+    fn attach_evidence_hash_succeeds() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let hash = valid_evidence_hash(&t.env);
+        t.client.attach_evidence_hash(&t.admin, &id, &hash);
+
+        let pkg = t.client.get_package(&id);
+        assert_eq!(pkg.evidence_hash, hash);
+    }
+
+    #[test]
+    fn attach_evidence_hash_emits_event() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let hash = valid_evidence_hash(&t.env);
+        t.client.attach_evidence_hash(&t.admin, &id, &hash);
+
+        let pkg = t.client.get_package(&id);
+        assert_eq!(pkg.evidence_hash, hash);
+    }
+
+    #[test]
+    fn attach_evidence_hash_rejects_overwrite() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let hash1 = valid_evidence_hash(&t.env);
+        t.client.attach_evidence_hash(&t.admin, &id, &hash1);
+
+        let hash2 = another_valid_evidence_hash(&t.env);
+        let result = t.client.try_attach_evidence_hash(&t.admin, &id, &hash2);
+        assert_eq!(result, Err(Ok(Error::InvalidState)));
+
+        let pkg = t.client.get_package(&id);
+        assert_eq!(pkg.evidence_hash, hash1);
+    }
+
+    #[test]
+    fn attach_evidence_hash_validates_format_length() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let short = soroban_sdk::String::from_str(
+            &t.env,
+            "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcde",
+        );
+        assert_eq!(
+            t.client.try_attach_evidence_hash(&t.admin, &id, &short),
+            Err(Ok(Error::InvalidState))
+        );
+
+        let long = soroban_sdk::String::from_str(
+            &t.env,
+            "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef1",
+        );
+        assert_eq!(
+            t.client.try_attach_evidence_hash(&t.admin, &id, &long),
+            Err(Ok(Error::InvalidState))
+        );
+
+        let empty = soroban_sdk::String::from_str(&t.env, "");
+        assert_eq!(
+            t.client.try_attach_evidence_hash(&t.admin, &id, &empty),
+            Err(Ok(Error::InvalidState))
+        );
+    }
+
+    #[test]
+    fn attach_evidence_hash_validates_hex_chars() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+
+        // Invalid char 'g'
+        t.fund_contract(ONE_TOKEN);
+        let id1 = t.client.create_package(
+            &t.admin,
+            &10u64,
+            &recipient,
+            &ONE_TOKEN,
+            &t.token,
+            &(t.now() + 3_600),
+            &Map::new(&t.env),
+        );
+        let invalid = soroban_sdk::String::from_str(
+            &t.env,
+            "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdeg",
+        );
+        assert_eq!(
+            t.client.try_attach_evidence_hash(&t.admin, &id1, &invalid),
+            Err(Ok(Error::InvalidState))
+        );
+
+        // Uppercase hex — valid
+        t.fund_contract(ONE_TOKEN);
+        let id2 = t.client.create_package(
+            &t.admin,
+            &11u64,
+            &recipient,
+            &ONE_TOKEN,
+            &t.token,
+            &(t.now() + 3_600),
+            &Map::new(&t.env),
+        );
+        let uppercase = soroban_sdk::String::from_str(
+            &t.env,
+            "A1B2C3D4E5F678901234567890ABCDEF1234567890ABCDEF1234567890ABCDEF",
+        );
+        assert!(t
+            .client
+            .try_attach_evidence_hash(&t.admin, &id2, &uppercase)
+            .is_ok());
+
+        // Mixed case hex — valid
+        t.fund_contract(ONE_TOKEN);
+        let id3 = t.client.create_package(
+            &t.admin,
+            &12u64,
+            &recipient,
+            &ONE_TOKEN,
+            &t.token,
+            &(t.now() + 3_600),
+            &Map::new(&t.env),
+        );
+        let mixed = soroban_sdk::String::from_str(
+            &t.env,
+            "A1b2C3d4E5f678901234567890aBcDeF1234567890aBcDeF1234567890aBcDeF",
+        );
+        assert!(t
+            .client
+            .try_attach_evidence_hash(&t.admin, &id3, &mixed)
+            .is_ok());
+    }
+
+    #[test]
+    fn attach_evidence_hash_requires_admin_auth() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let stranger = Address::generate(&t.env);
+        let hash = valid_evidence_hash(&t.env);
+
+        let result = t.client.try_attach_evidence_hash(&stranger, &id, &hash);
+        assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    }
+
+    #[test]
+    fn attach_evidence_hash_fails_for_nonexistent_package() {
+        let t = TestSetup::new();
+        let hash = valid_evidence_hash(&t.env);
+
+        let result = t.client.try_attach_evidence_hash(&t.admin, &999u64, &hash);
+        assert_eq!(result, Err(Ok(Error::PackageNotFound)));
+    }
+
+    #[test]
+    fn evidence_hash_retrievable_via_get_package() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let hash = valid_evidence_hash(&t.env);
+        t.client.attach_evidence_hash(&t.admin, &id, &hash);
+
+        let pkg = t.client.get_package(&id);
+        assert_eq!(pkg.evidence_hash, hash);
+        assert_eq!(pkg.id, id);
+        assert_eq!(pkg.recipient, recipient);
+    }
+
+    #[test]
+    fn package_created_with_empty_evidence_hash() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let pkg = t.client.get_package(&id);
+        assert_eq!(pkg.evidence_hash, soroban_sdk::String::from_str(&t.env, ""));
+    }
+
+    #[test]
+    fn attach_evidence_hash_after_claim_succeeds() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        t.client.claim(&id);
+
+        let hash = valid_evidence_hash(&t.env);
+        let result = t.client.try_attach_evidence_hash(&t.admin, &id, &hash);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_evidence_hash_returns_empty_when_not_set() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let result = t.client.get_evidence_hash(&id);
+        assert_eq!(result, soroban_sdk::String::from_str(&t.env, ""));
+    }
+
+    #[test]
+    fn get_evidence_hash_returns_hash_after_attach() {
+        let t = TestSetup::new();
+        let recipient = Address::generate(&t.env);
+        let id = t.create_default_package(&recipient, ONE_TOKEN);
+
+        let hash = valid_evidence_hash(&t.env);
+        t.client.attach_evidence_hash(&t.admin, &id, &hash);
+
+        let result = t.client.get_evidence_hash(&id);
+        assert_eq!(result, hash);
     }
 }

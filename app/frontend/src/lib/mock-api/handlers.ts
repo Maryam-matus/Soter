@@ -1,17 +1,15 @@
 import type { BackendHealthResponse } from '@/types/health';
 import type { AidPackage } from '@/types/aid-package';
-
-
 import type {
   VerificationInboxItem,
   VerificationInboxResponse,
   VerificationStats,
-  InternalNote,
   VerificationStatus,
+  InternalNote,
 } from '@/types/verification-review';
 import type { ContractRegistryResponse } from '@/types/contract-registry';
 import type { RunbookResponse } from '@/types/runbook';
-
+import type { ContractGlobalStats } from '@/lib/api-contract';
 
 export type MockHandler = (
   url: string,
@@ -47,6 +45,180 @@ interface StoredCredential {
 }
 
 const registeredCredentials: StoredCredential[] = [];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Verification Inbox Mock Data & Handlers
+//
+// Restored from the original implementation (see #729) after a later merge
+// clobbered these handlers, leaving `/v1/verification-inbox` unhandled and
+// the mock-parity review page unusable in demo mode.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let inboxNoteCounter = 5;
+
+const inboxItems: VerificationInboxItem[] = [
+  {
+    id: 'vfy-001',
+    status: 'pending_review',
+    createdAt: new Date('2026-07-20T10:00:00.000Z').toISOString(),
+    reviewedAt: null,
+    reviewedBy: null,
+    rejectionReason: null,
+    nextStepMessage: 'Review identity documents for authenticity',
+    deepLink: '/verification/vfy-001',
+    aiScore: 0.42,
+    riskLevel: 'medium',
+    documentType: 'national_id',
+  },
+  {
+    id: 'vfy-002',
+    status: 'pending_review',
+    createdAt: new Date('2026-07-19T15:30:00.000Z').toISOString(),
+    reviewedAt: null,
+    reviewedBy: null,
+    rejectionReason: null,
+    nextStepMessage: 'Cross-reference proof-of-life with recipient registry',
+    deepLink: '/verification/vfy-002',
+    aiScore: 0.88,
+    riskLevel: 'high',
+    documentType: 'proof_of_life',
+  },
+  {
+    id: 'vfy-003',
+    status: 'approved',
+    createdAt: new Date('2026-07-15T08:00:00.000Z').toISOString(),
+    reviewedAt: new Date('2026-07-16T14:00:00.000Z').toISOString(),
+    reviewedBy: 'reviewer-demo',
+    rejectionReason: null,
+    nextStepMessage: 'Verification approved. Proceed to disbursement.',
+    deepLink: '/verification/vfy-003',
+    aiScore: 0.15,
+    riskLevel: 'low',
+    documentType: 'national_id',
+  },
+  {
+    id: 'vfy-004',
+    status: 'rejected',
+    createdAt: new Date('2026-07-14T12:00:00.000Z').toISOString(),
+    reviewedAt: new Date('2026-07-16T10:00:00.000Z').toISOString(),
+    reviewedBy: 'reviewer-demo',
+    rejectionReason: 'Document appears fraudulent',
+    nextStepMessage: 'Please resubmit with valid documentation',
+    deepLink: '/verification/vfy-004',
+    aiScore: 0.95,
+    riskLevel: 'high',
+    documentType: 'national_id',
+  },
+  {
+    id: 'vfy-005',
+    status: 'needs_resubmission',
+    createdAt: new Date('2026-07-13T09:00:00.000Z').toISOString(),
+    reviewedAt: new Date('2026-07-17T11:00:00.000Z').toISOString(),
+    reviewedBy: 'reviewer-demo',
+    rejectionReason: 'Document expired',
+    nextStepMessage: 'Please submit a current government-issued ID',
+    deepLink: '/verification/vfy-005',
+    aiScore: 0.55,
+    riskLevel: 'medium',
+    documentType: 'national_id',
+  },
+  {
+    id: 'vfy-006',
+    status: 'pending_review',
+    createdAt: new Date('2026-07-18T14:00:00.000Z').toISOString(),
+    reviewedAt: null,
+    reviewedBy: null,
+    rejectionReason: null,
+    nextStepMessage: 'Verify biometric match score against threshold',
+    deepLink: '/verification/vfy-006',
+    aiScore: 0.62,
+    riskLevel: 'medium',
+    documentType: 'biometric',
+  },
+  {
+    id: 'vfy-007',
+    status: 'approved',
+    createdAt: new Date('2026-07-10T11:00:00.000Z').toISOString(),
+    reviewedAt: new Date('2026-07-12T16:00:00.000Z').toISOString(),
+    reviewedBy: 'reviewer-demo',
+    rejectionReason: null,
+    nextStepMessage: 'Verification approved. Ready for claim.',
+    deepLink: '/verification/vfy-007',
+    aiScore: 0.08,
+    riskLevel: 'low',
+    documentType: 'proof_of_life',
+  },
+  {
+    id: 'vfy-008',
+    status: 'pending_review',
+    createdAt: new Date('2026-07-17T16:00:00.000Z').toISOString(),
+    reviewedAt: null,
+    reviewedBy: null,
+    rejectionReason: null,
+    nextStepMessage: 'Validate document expiry and issuer authority',
+    deepLink: '/verification/vfy-008',
+    aiScore: 0.73,
+    riskLevel: 'high',
+    documentType: 'national_id',
+  },
+];
+
+const inboxNotes: InternalNote[] = [
+  {
+    id: 'note-1',
+    entityType: 'verification',
+    entityId: 'vfy-001',
+    content: 'Document looks legitimate but need to verify issuer registry.',
+    authorId: 'reviewer-demo',
+    category: 'review',
+    createdAt: new Date('2026-07-21T11:00:00.000Z').toISOString(),
+    updatedAt: new Date('2026-07-21T11:00:00.000Z').toISOString(),
+  },
+  {
+    id: 'note-2',
+    entityType: 'verification',
+    entityId: 'vfy-002',
+    content: 'Cross-referenced with UNHCR registry — awaiting confirmation.',
+    authorId: 'reviewer-demo',
+    category: 'follow_up',
+    createdAt: new Date('2026-07-20T09:00:00.000Z').toISOString(),
+    updatedAt: new Date('2026-07-20T09:00:00.000Z').toISOString(),
+  },
+  {
+    id: 'note-3',
+    entityType: 'verification',
+    entityId: 'vfy-002',
+    content: 'Elevating to senior reviewer due to high AI risk score.',
+    authorId: 'reviewer-demo',
+    category: 'escalation',
+    createdAt: new Date('2026-07-21T08:00:00.000Z').toISOString(),
+    updatedAt: new Date('2026-07-21T08:00:00.000Z').toISOString(),
+  },
+  {
+    id: 'note-4',
+    entityType: 'verification',
+    entityId: 'vfy-003',
+    content: 'All documents verified — approved by consensus.',
+    authorId: 'reviewer-demo',
+    category: 'review_approved',
+    createdAt: new Date('2026-07-16T14:30:00.000Z').toISOString(),
+    updatedAt: new Date('2026-07-16T14:30:00.000Z').toISOString(),
+  },
+];
+
+function getInboxStats(): VerificationStats {
+  const stats: VerificationStats = {
+    pending_review: 0,
+    approved: 0,
+    rejected: 0,
+    needs_resubmission: 0,
+    total: inboxItems.length,
+  };
+  for (const item of inboxItems) {
+    stats[item.status] += 1;
+  }
+  return stats;
+}
 
 const webauthnRegisterOptionsHandler: MockHandler = async (url) => {
   const urlObj = new URL(url, 'http://localhost');
@@ -150,10 +322,7 @@ const webauthnRegisterVerifyHandler: MockHandler = async (_url, options) => {
   );
 };
 
-const webauthnAuthOptionsHandler: MockHandler = async (url) => {
-  const urlObj = new URL(url, 'http://localhost');
-  const userId = urlObj.searchParams.get('userId');
-
+const webauthnAuthOptionsHandler: MockHandler = async () => {
   const challenge = base64UrlEncode(randomBytes(32));
 
   const allowCredentials = registeredCredentials.map((cred) => ({
@@ -229,13 +398,22 @@ const webauthnAuthVerifyHandler: MockHandler = async (_url, options) => {
 };
 
 const healthHandler: MockHandler = async () => {
+  // Shape mirrors the backend's LivenessResponse
+  // (app/backend/src/health/health.service.ts); validated against
+  // src/lib/api-contract.ts by src/lib/mock-api/contract.test.ts (issue #1143).
   const mockResponse: BackendHealthResponse = {
     status: 'ok',
     timestamp: new Date().toISOString(),
     version: '1.0.0-mock',
-    service: 'soter-backend-mock',
-    details: {
-      uptime: 12345,
+    service: 'backend',
+    environment: 'mock',
+    checks: {
+      process: {
+        status: 'up',
+        details: {
+          uptimeSeconds: 12345,
+        },
+      },
     },
   };
 
@@ -331,6 +509,10 @@ const aidPackagesHandler: MockHandler = async (url) => {
   const search = urlObj.searchParams.get('search') ?? '';
   const status = urlObj.searchParams.get('status') ?? '';
   const token = urlObj.searchParams.get('token') ?? '';
+  const page = Math.max(1, parseInt(urlObj.searchParams.get('page') ?? '1', 10) || 1);
+  const size = Math.min(100, Math.max(1, parseInt(urlObj.searchParams.get('size') ?? '10', 10) || 10));
+  const sortBy = urlObj.searchParams.get('sortBy') ?? 'id';
+  const sortDirection = urlObj.searchParams.get('sortDirection') ?? 'asc';
 
   let results = [...ALL_PACKAGES];
 
@@ -352,7 +534,28 @@ const aidPackagesHandler: MockHandler = async (url) => {
     results = results.filter(p => p.token === token);
   }
 
-  return new Response(JSON.stringify(results), {
+  // Sort (guard the empty-result case: `in` on undefined throws)
+  if (sortBy && results.length > 0 && sortBy in results[0]) {
+    results.sort((a, b) => {
+      const aVal = a[sortBy as keyof AidPackage] ?? '';
+      const bVal = b[sortBy as keyof AidPackage] ?? '';
+      const cmp = String(aVal).localeCompare(String(bVal));
+      return sortDirection === 'desc' ? -cmp : cmp;
+    });
+  }
+
+  const total = results.length;
+  const totalPages = Math.ceil(total / size);
+  const startIdx = (page - 1) * size;
+  const paginatedResults = results.slice(startIdx, startIdx + size);
+
+  return new Response(JSON.stringify({
+    data: paginatedResults,
+    total,
+    page,
+    size,
+    totalPages,
+  }), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
@@ -394,7 +597,7 @@ const campaignsHandler: MockHandler = async () => {
 
 const campaignCreateHandler: MockHandler = async (_url, options) => {
   if (!options?.body) {
-    return new Response(JSON.stringify({ success: false, message: 'Request body missing' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ success: false, message: 'Request body missing', data: null }), { status: 400, headers: { 'Content-Type': 'application/json' } });
   }
 
   const payload = JSON.parse(options.body.toString());
@@ -423,11 +626,11 @@ const campaignUpdateHandler: MockHandler = async (url, options) => {
   const campaign = campaignsStore.find(item => item.id === id);
 
   if (!campaign) {
-    return new Response(JSON.stringify({ success: false, message: 'Campaign not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ success: false, message: 'Campaign not found', data: null }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 
   if (!options?.body) {
-    return new Response(JSON.stringify({ success: false, message: 'Request body missing' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ success: false, message: 'Request body missing', data: null }), { status: 400, headers: { 'Content-Type': 'application/json' } });
   }
 
   const payload = JSON.parse(options.body.toString());
@@ -454,7 +657,7 @@ const campaignGetHandler: MockHandler = async (url) => {
   const campaign = campaignsStore.find(item => item.id === id);
 
   if (!campaign) {
-    return new Response(JSON.stringify({ success: false, message: 'Campaign not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ success: false, message: 'Campaign not found', data: null }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 
   return new Response(JSON.stringify({ success: true, data: campaign, message: 'Campaign fetched successfully' }), {
@@ -469,7 +672,7 @@ const campaignTimelineHandler: MockHandler = async (url) => {
   const campaign = campaignsStore.find(item => item.id === id);
 
   if (!campaign) {
-    return new Response(JSON.stringify({ success: false, message: 'Campaign not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ success: false, message: 'Campaign not found', data: null }), { status: 404, headers: { 'Content-Type': 'application/json' } });
   }
 
   const now = Date.now();
@@ -586,7 +789,7 @@ function requireImportFormData(options?: RequestInit):
 
   if (!(body instanceof FormData)) {
     return {
-      error: new Response(JSON.stringify({ success: false, message: 'Form data is required' }), {
+      error: new Response(JSON.stringify({ success: false, message: 'Form data is required', data: null }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       }),
@@ -596,7 +799,7 @@ function requireImportFormData(options?: RequestInit):
   const file = body.get('file');
   if (!(file instanceof File)) {
     return {
-      error: new Response(JSON.stringify({ success: false, message: 'CSV file is required' }), {
+      error: new Response(JSON.stringify({ success: false, message: 'CSV file is required', data: null }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       }),
@@ -770,7 +973,7 @@ const recipientsImportConfirmHandler: MockHandler = async (_url, options) => {
   const body = options?.body;
 
   if (!(body instanceof FormData)) {
-    return new Response(JSON.stringify({ success: false, message: 'Form data is required' }), {
+    return new Response(JSON.stringify({ success: false, message: 'Form data is required', data: null }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -778,7 +981,7 @@ const recipientsImportConfirmHandler: MockHandler = async (_url, options) => {
 
   const file = body.get('file');
   if (!(file instanceof File)) {
-    return new Response(JSON.stringify({ success: false, message: 'CSV file is required' }), {
+    return new Response(JSON.stringify({ success: false, message: 'CSV file is required', data: null }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -789,8 +992,6 @@ const recipientsImportConfirmHandler: MockHandler = async (_url, options) => {
     headers: { 'Content-Type': 'application/json' },
   });
 };
-
-
 
 // POST /v1/verification-inbox/:id/notes
 const inboxAddNoteHandler: MockHandler = async (url, options) => {
@@ -831,9 +1032,181 @@ const inboxAddNoteHandler: MockHandler = async (url, options) => {
   });
 };
 
+// GET /v1/verification-inbox
+const inboxListHandler: MockHandler = async (url) => {
+  let urlObj: URL;
+  try {
+    urlObj = new URL(url);
+  } catch {
+    urlObj = new URL(url, 'http://localhost');
+  }
+
+  const status = urlObj.searchParams.get('status') ?? '';
+  const riskLevel = urlObj.searchParams.get('riskLevel') ?? '';
+  const dateFrom = urlObj.searchParams.get('dateFrom') ?? '';
+  const dateTo = urlObj.searchParams.get('dateTo') ?? '';
+  const page = parseInt(urlObj.searchParams.get('page') ?? '1', 10) || 1;
+  const limit = parseInt(urlObj.searchParams.get('limit') ?? '20', 10) || 20;
+
+  let results = [...inboxItems];
+
+  if (status) {
+    results = results.filter(item => item.status === status);
+  }
+  if (riskLevel) {
+    results = results.filter(item => item.riskLevel === riskLevel);
+  }
+  // `campaignId` is accepted but ignored: mock items carry no campaignId yet,
+  // so filtering on it would always return an empty queue.
+  if (dateFrom) {
+    const from = new Date(dateFrom).getTime();
+    results = results.filter(item => new Date(item.createdAt).getTime() >= from);
+  }
+  if (dateTo) {
+    const to = new Date(dateTo).getTime();
+    results = results.filter(item => new Date(item.createdAt).getTime() <= to);
+  }
+
+  const total = results.length;
+  const totalPages = Math.ceil(total / limit) || 1;
+  const start = (page - 1) * limit;
+  const paged = results.slice(start, start + limit);
+
+  const body: VerificationInboxResponse = {
+    items: paged,
+    total,
+    page,
+    limit,
+    totalPages,
+  };
+
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
+// GET /v1/verification-inbox/stats
+const inboxStatsHandler: MockHandler = async () => {
+  const stats = getInboxStats();
+  return new Response(JSON.stringify(stats), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
+// GET /v1/verification-inbox/:id
+const inboxDetailHandler: MockHandler = async (url) => {
+  const id = url.split('?')[0].split('/').pop() ?? '';
+  const item = inboxItems.find(i => i.id === id);
+
+  if (!item) {
+    return new Response(JSON.stringify({ message: 'Verification request not found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  return new Response(JSON.stringify(item), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
+/** Shared review transition for approve/reject/request-resubmission. */
+function applyReviewDecision(
+  url: string,
+  options: RequestInit | undefined,
+  status: VerificationStatus,
+  noteCategory: string,
+  fallbackReason: boolean,
+): Response {
+  const id = url.split('?')[0].split('/').slice(-2)[0];
+  const item = inboxItems.find(i => i.id === id);
+
+  if (!item) {
+    return new Response(JSON.stringify({ message: 'Verification request not found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  if (item.status === 'approved' || item.status === 'rejected') {
+    return new Response(JSON.stringify({ message: 'Verification already processed' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  let payload: { rejectionReason?: string; nextStepMessage?: string; internalNote?: string } = {};
+  if (options?.body) {
+    try {
+      payload = JSON.parse(options.body.toString());
+    } catch { /* ignore */ }
+  }
+
+  const now = new Date().toISOString();
+  item.status = status;
+  item.reviewedAt = now;
+  item.reviewedBy = 'reviewer-demo';
+  if (fallbackReason) {
+    item.rejectionReason = payload.rejectionReason ?? null;
+  }
+  if (payload.nextStepMessage) {
+    item.nextStepMessage = payload.nextStepMessage;
+  }
+
+  if (payload.internalNote) {
+    inboxNotes.push({
+      id: `note-${++inboxNoteCounter}`,
+      entityType: 'verification',
+      entityId: id,
+      content: payload.internalNote,
+      authorId: 'reviewer-demo',
+      category: noteCategory,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  return new Response(JSON.stringify(item), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+// POST /v1/verification-inbox/:id/approve
+const inboxApproveHandler: MockHandler = async (url, options) =>
+  applyReviewDecision(url, options, 'approved', 'review_approved', false);
+
+// POST /v1/verification-inbox/:id/reject
+const inboxRejectHandler: MockHandler = async (url, options) =>
+  applyReviewDecision(url, options, 'rejected', 'review_rejected', true);
+
+// POST /v1/verification-inbox/:id/request-resubmission
+const inboxResubmitHandler: MockHandler = async (url, options) =>
+  applyReviewDecision(url, options, 'needs_resubmission', 'review_needs_resubmission', true);
+
+// GET /v1/verification-inbox/:id/notes
+const inboxGetNotesHandler: MockHandler = async (url) => {
+  const id = url.split('?')[0].split('/').slice(-2)[0];
+  const item = inboxItems.find(i => i.id === id);
+
+  if (!item) {
+    return new Response(JSON.stringify({ message: 'Verification request not found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const notes = inboxNotes.filter(n => n.entityId === id);
+  return new Response(JSON.stringify(notes), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
 const dashboardSummaryHandler: MockHandler = async () => {
-  // Derive live totals from the in-memory mock data instead of returning
-  // hard-coded zeros so that the dashboard cards display meaningful metrics.
   const totalClaims = inboxItems.length;
   const totalPackages = ALL_PACKAGES.length;
   const pendingReviews = inboxItems.filter(
@@ -843,19 +1216,44 @@ const dashboardSummaryHandler: MockHandler = async () => {
     p => p.status === 'Claimed',
   ).length;
 
-  return new Response(
-    JSON.stringify({
-      totalClaims,
-      totalPackages,
-      pendingReviews,
-      totalDisbursements,
-    }),
-    { status: 200, headers: { 'Content-Type': 'application/json' } },
-  );
+  // Mirrors the backend GlobalStatsDto (app/backend/src/analytics/dto/index.ts),
+  // served by GET /analytics/global-stats.
+  const stats: ContractGlobalStats = {
+    totalClaims,
+    totalPackages,
+    pendingReviews,
+    totalDisbursements,
+    totalAidDisbursed: 87500,
+    totalRecipients: totalPackages,
+    activeCampaigns: ALL_PACKAGES.filter(p => p.status === 'Active').length,
+    byToken: [
+      { label: 'USDC', totalAmount: 85000, count: 3 },
+      { label: 'XLM', totalAmount: 50000, count: 2 },
+      { label: 'EURC', totalAmount: 30000, count: 2 },
+    ],
+    byRegion: [
+      { label: 'Eastern Region', totalAmount: 62500, count: 2 },
+      { label: 'Northern Zone', totalAmount: 33000, count: 2 },
+    ],
+    timeSeries: [
+      {
+        date: new Date().toISOString().slice(0, 10),
+        totalAmount: 87500,
+        count: totalClaims,
+      },
+    ],
+    computedAt: new Date().toISOString(),
+  };
+
+  return new Response(JSON.stringify(stats), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 };
 
-
 const contractRegistryHandler: MockHandler = async () => {
+  // Mirrors the real output of app/onchain/scripts/generate-registry.py —
+  // the frontend contract-registry types are aligned to this exact shape.
   const registry: ContractRegistryResponse = {
     schema_version: 2,
     generated_at: new Date().toISOString(),
@@ -865,16 +1263,12 @@ const contractRegistryHandler: MockHandler = async () => {
         networks: {
           testnet: {
             contract_id: 'CDSBJ27PKTNFTRW6OKPCVXDRUSSRUIQUG6DW5PUTKLDXTDT23NQIS6JG',
+            wasm_hash: '24328e15b7c11c7ff07caeaf0328da591b3b63e84af57fa03623c10126eabc8d',
             version: '0.1.0',
             deployed_at: '2026-06-03',
           },
         },
       },
-    },
-    source: {
-      canonical_path: 'app/onchain/deployments/contract-registry.json',
-      generator_script: 'app/onchain/scripts/generate-registry.py',
-      deployment_registry: 'app/onchain/deployments/registry.json',
     },
   };
 
@@ -1057,63 +1451,13 @@ const runbookHandler: MockHandler = async () => {
           actions: [
             { id: 'rl-1', description: 'Wait 2-5 minutes before retrying', command: 'Start-Sleep -Seconds 120' },
             { id: 'rl-2', description: 'Use dedicated RPC provider if public endpoint is throttled' },
-            { id: 'rl-3', description: 'Batch requests to reduce call frequency' },
+            { id: 'rl-3', description: 'Batch requests where possible' },
           ],
-          relatedDocs: ['DEPLOY_TESTNET_RUNBOOK.md §9.5'],
-        },
-        {
-          id: 'insufficient-xlm',
-          symptomKey: 'issueXlmSymptom',
-          causeKey: 'issueXlmCause',
-          severity: 'high',
-          actions: [
-            { id: 'xlm-1', description: 'Request testnet XLM via Friendbot', command: 'curl "https://friendbot.stellar.org/?addr=YOUR_ADDRESS"' },
-            { id: 'xlm-2', description: 'Check balance with Stellar Laboratory' },
-            { id: 'xlm-3', description: 'Allow 5-10 seconds for ledger confirmation' },
-            { id: 'xlm-4', description: 'Ensure base reserve (1 XLM) plus fees are covered' },
-          ],
-        },
-        {
-          id: 'stale-ledger',
-          symptomKey: 'issueStaleLedgerSymptom',
-          causeKey: 'issueStaleLedgerCause',
-          severity: 'medium',
-          actions: [
-            { id: 'sl-1', description: 'Wait for ledger sync (typically 5-30 seconds)' },
-            { id: 'sl-2', description: 'Verify RPC provider is fully synced' },
-            { id: 'sl-3', description: 'Retry query with fresh RPC connection' },
-            { id: 'sl-4', description: 'Run ledger reconciliation if off-chain state drifts' },
-          ],
-          relatedDocs: ['DEPLOY_TESTNET_RUNBOOK.md §9.3'],
-        },
-        {
-          id: 'contract-id-mismatch',
-          symptomKey: 'issueContractMismatchSymptom',
-          causeKey: 'issueContractMismatchCause',
-          severity: 'high',
-          actions: [
-            { id: 'cm-1', description: 'Check canonical contract registry for correct Contract ID' },
-            { id: 'cm-2', description: 'Update CONTRACT_ID in backend .env file' },
-            { id: 'cm-3', description: 'Restart backend service to pick up new config' },
-            { id: 'cm-4', description: 'Clear browser localStorage cached package IDs' },
-            { id: 'cm-5', description: 'Run redeployment checklist if fresh deploy needed' },
-          ],
-          relatedDocs: ['DEPLOY_TESTNET_RUNBOOK.md §12', 'testnet-deployment-plan.md §5'],
-        },
-        {
-          id: 'wallet-network-mismatch',
-          symptomKey: 'issueWalletMismatchSymptom',
-          causeKey: 'issueWalletMismatchCause',
-          severity: 'medium',
-          actions: [
-            { id: 'wm-1', description: 'Open Freighter wallet settings' },
-            { id: 'wm-2', description: 'Switch network to Testnet (not Mainnet or Futurenet)' },
-            { id: 'wm-3', description: 'Refresh page and re-connect wallet' },
-            { id: 'wm-4', description: 'Confirm network indicator shows Testnet' },
-          ],
+          relatedDocs: ['DEPLOY_TESTNET_RUNBOOK.md §9.2'],
         },
       ],
     },
+    // Canonical registry locations, mirroring RunbookResponse.contractRegistry.
     contractRegistry: {
       canonicalSourcePath: 'app/onchain/deployments/contract-registry.json',
       generatorScript: 'app/onchain/scripts/generate-registry.py',
@@ -1127,20 +1471,27 @@ const runbookHandler: MockHandler = async () => {
   });
 };
 
-
+/**
+ * Path → handler registry consumed by the fetch client (./client.ts).
+ *
+ * This map was dropped from handlers.ts while client.ts kept importing it,
+ * which left the mock client uncompilable. It is restored here (and covered by
+ * contract.test.ts) so every mock handler stays reachable — issue #1143.
+ */
 export const handlers: Record<string, MockHandler> = {
   '/health': healthHandler,
   '/aid-packages': aidPackagesHandler,
   '/analytics/global-stats': dashboardSummaryHandler,
+  '/notifications/activity-feed': activityFeedHandler,
   '/recipients/import/validate': recipientsImportValidateHandler,
   '/recipients/import/report': recipientsImportReportHandler,
   '/recipients/import/confirm': recipientsImportConfirmHandler,
-  '/notifications/activity-feed': activityFeedHandler,
 
   '/auth/webauthn/register/options': webauthnRegisterOptionsHandler,
   '/auth/webauthn/register/verify': webauthnRegisterVerifyHandler,
   '/auth/webauthn/auth/options': webauthnAuthOptionsHandler,
   '/auth/webauthn/auth/verify': webauthnAuthVerifyHandler,
+
   '/v1/verification-inbox': inboxListHandler,
   '/v1/verification-inbox/stats': inboxStatsHandler,
   '/v1/verification-inbox/:id': async (url, options) => {
@@ -1166,10 +1517,10 @@ export const handlers: Record<string, MockHandler> = {
       return inboxDetailHandler(url, options);
     }
 
-    return new Response(JSON.stringify({ message: 'Method not implemented in mock' }), {
-      status: 405,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return new Response(
+      JSON.stringify({ success: false, message: 'Method not implemented in mock', data: null }),
+      { status: 405, headers: { 'Content-Type': 'application/json' } },
+    );
   },
 
   '/campaigns': async (url, options) => {
@@ -1190,8 +1541,12 @@ export const handlers: Record<string, MockHandler> = {
     if (method === 'GET') {
       return campaignGetHandler(url, options);
     }
-    return new Response(JSON.stringify({ success: false, message: 'Method not implemented in mock' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
+    return new Response(
+      JSON.stringify({ success: false, message: 'Method not implemented in mock', data: null }),
+      { status: 405, headers: { 'Content-Type': 'application/json' } },
+    );
   },
+
   '/contract-registry': contractRegistryHandler,
   '/runbook': runbookHandler,
 };

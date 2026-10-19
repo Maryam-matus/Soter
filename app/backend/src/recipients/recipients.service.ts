@@ -1,5 +1,9 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable } from '@nestjs/common';
+import { RecipientRemovalReasonCode } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
+import { PrismaService } from '../prisma/prisma.service';
+import { RecipientRemovalQueryDto } from './dto/recipient-removal.dto';
 
 export type ImportRowStatus = 'valid' | 'warning' | 'error';
 export type ImportMessageSeverity = 'warning' | 'error';
@@ -42,18 +46,103 @@ export interface ImportReport {
 }
 
 const NAME_HEADERS = ['name', 'fullname', 'recipientname'];
-const WALLET_HEADERS = ['wallet', 'walletaddress', 'stellarwallet', 'publickey'];
+const WALLET_HEADERS = [
+  'wallet',
+  'walletaddress',
+  'stellarwallet',
+  'publickey',
+];
 const PHONE_HEADERS = ['phone', 'phonenumber', 'mobile'];
 
 @Injectable()
 export class RecipientsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async remove(
+    recipientRef: string,
+    reasonCode: RecipientRemovalReasonCode,
+    reason: string | undefined,
+    removedBy: string,
+    ngoId?: string,
+  ) {
+    if (
+      typeof recipientRef !== 'string' ||
+      typeof removedBy !== 'string' ||
+      !Object.values(RecipientRemovalReasonCode).includes(reasonCode)
+    ) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'A recipient reference, authenticated actor, and valid reason code are required.',
+      );
+    }
+    const normalizedRecipientRef = recipientRef.trim();
+    const normalizedActor = removedBy.trim();
+    if (!normalizedRecipientRef || !normalizedActor) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'A recipient reference and authenticated actor are required.',
+      );
+    }
+
+    return this.prisma.recipientRemoval.create({
+      data: {
+        recipientRef: normalizedRecipientRef,
+        ngoId: ngoId ?? null,
+        reasonCode,
+        reason: reason?.trim() || null,
+        removedBy: normalizedActor,
+      },
+    });
+  }
+
+  async findRemovals(query: RecipientRemovalQueryDto = {}, ngoId?: string) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 50;
+    if (
+      !Number.isInteger(page) ||
+      page < 1 ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 200
+    ) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Page must be positive and limit must be between 1 and 200.',
+      );
+    }
+    const recipientRef = query.recipientRef?.trim();
+    const where = {
+      ...(recipientRef ? { recipientRef } : {}),
+      ...(ngoId ? { ngoId } : {}),
+    };
+
+    const [data, total] = await Promise.all([
+      this.prisma.recipientRemoval.findMany({
+        where,
+        orderBy: [{ removedAt: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.recipientRemoval.count({ where }),
+    ]);
+
+    return { data, total, page, limit };
+  }
+
   /**
    * Validates the raw contents of an uploaded recipient CSV and produces
    * row-level results that can be serialized to JSON or a CSV report.
    */
   validateImport(csvText: string): ImportValidationOutcome {
     if (typeof csvText !== 'string' || csvText.trim().length === 0) {
-      throw new BadRequestException('The uploaded CSV file is empty.');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'The uploaded CSV file is empty.',
+      );
     }
 
     const lines = csvText
@@ -69,21 +158,31 @@ export class RecipientsService {
       .filter(Boolean);
 
     if (headers.length === 0) {
-      throw new BadRequestException('The uploaded CSV file is missing a header row.');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'The uploaded CSV file is missing a header row.',
+      );
     }
 
     const normalizedHeaders = headers.map(header =>
       header.toLowerCase().replace(/[_\s-]+/g, ''),
     );
-    const nameIndex = normalizedHeaders.findIndex(header => NAME_HEADERS.includes(header));
-    const walletIndex = normalizedHeaders.findIndex(header => WALLET_HEADERS.includes(header));
-    const phoneIndex = normalizedHeaders.findIndex(header => PHONE_HEADERS.includes(header));
+    const nameIndex = normalizedHeaders.findIndex(header =>
+      NAME_HEADERS.includes(header),
+    );
+    const walletIndex = normalizedHeaders.findIndex(header =>
+      WALLET_HEADERS.includes(header),
+    );
+    const phoneIndex = normalizedHeaders.findIndex(header =>
+      PHONE_HEADERS.includes(header),
+    );
 
     const rows = dataLines.map((line, index) => {
       const values = line.split(',').map(value => value.trim());
-      const name = nameIndex >= 0 ? values[nameIndex] ?? '' : '';
-      const wallet = walletIndex >= 0 ? values[walletIndex] ?? '' : '';
-      const phone = phoneIndex >= 0 ? values[phoneIndex] ?? '' : '';
+      const name = nameIndex >= 0 ? (values[nameIndex] ?? '') : '';
+      const wallet = walletIndex >= 0 ? (values[walletIndex] ?? '') : '';
+      const phone = phoneIndex >= 0 ? (values[phoneIndex] ?? '') : '';
       const messages: ImportValidationMessage[] = [];
 
       if (!name) {
@@ -116,7 +215,9 @@ export class RecipientsService {
         });
       }
 
-      const status: ImportRowStatus = messages.some(message => message.severity === 'error')
+      const status: ImportRowStatus = messages.some(
+        message => message.severity === 'error',
+      )
         ? 'error'
         : messages.some(message => message.severity === 'warning')
           ? 'warning'
@@ -149,7 +250,10 @@ export class RecipientsService {
    * one record per row-level message (severity, field, message) plus the row's
    * key values, so operators can locate and fix failures without the raw file.
    */
-  buildImportReport(campaignId: string, outcome: ImportValidationOutcome): ImportReport {
+  buildImportReport(
+    campaignId: string,
+    outcome: ImportValidationOutcome,
+  ): ImportReport {
     const reportId = `rpt-${Date.now().toString(36)}-${randomBytes(5).toString('hex')}`;
     const generatedAt = new Date().toISOString();
 
@@ -165,13 +269,23 @@ export class RecipientsService {
       `# errorRows: ${outcome.summary.errorRows}`,
     ].join('\n');
 
-    const headerRow = 'rowNumber,status,severity,field,message,name,wallet,phone';
+    const headerRow =
+      'rowNumber,status,severity,field,message,name,wallet,phone';
     const bodyLines: string[] = [];
 
     for (const row of outcome.rows) {
       if (row.messages.length === 0) {
         bodyLines.push(
-          [row.rowNumber, row.status, '', '', '', row.values.name, row.values.wallet, row.values.phone]
+          [
+            row.rowNumber,
+            row.status,
+            '',
+            '',
+            '',
+            row.values.name,
+            row.values.wallet,
+            row.values.phone,
+          ]
             .map(value => this.escapeCsvValue(String(value)))
             .join(','),
         );

@@ -4,6 +4,13 @@ import { fireEvent, render } from '@testing-library/react-native';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { config } from '../config';
 
+let mockWalletState = {
+  disconnectWallet: jest.fn(),
+  publicKey: null as string | null,
+  isOnCorrectNetwork: false,
+  status: 'idle',
+};
+
 jest.mock('../theme/ThemeContext', () => ({
   useTheme: () => {
     const { Colors, SoterLightTheme } = require('../theme/theme');
@@ -41,6 +48,74 @@ jest.mock('../contexts/SaverModeContext', () => ({
   }),
 }));
 
+let mockSyncFrequency = 'normal' as 'aggressive' | 'normal' | 'conservative';
+const mockSetSyncFrequency = jest.fn((freq) => {
+  mockSyncFrequency = freq;
+});
+
+jest.mock('../contexts/SyncDeferralContext', () => ({
+  ...jest.requireActual('../contexts/SyncDeferralContext'),
+  useSyncDeferral: () => ({
+    syncFrequency: mockSyncFrequency,
+    setSyncFrequency: mockSetSyncFrequency,
+    batteryLevel: 1,
+    isCharging: true,
+    isMetered: false,
+    meteredOptIn: false,
+    forceSyncOverride: false,
+    deferralReason: 'none',
+    estimatedUploadSize: 0,
+    setMeteredOptIn: jest.fn(),
+    forceSync: jest.fn(),
+    clearForceSync: jest.fn(),
+    setEstimatedUploadSize: jest.fn(),
+    shouldDeferAction: jest.fn().mockReturnValue({ deferred: false, reason: 'none' }),
+    getDeferralExplanation: jest.fn().mockReturnValue('Sync is active'),
+  }),
+}));
+
+jest.mock('../contexts/CrashReportingContext', () => ({
+  useCrashReporting: () => ({
+    enabled: true,
+    toggle: jest.fn(),
+  }),
+}));
+
+jest.mock('../contexts/SharedDeviceContext', () => ({
+  useSharedDevice: () => ({
+    enabled: false,
+    toggle: jest.fn(),
+  }),
+}));
+
+jest.mock('../contexts/WalletContext', () => ({
+  useWallet: () => mockWalletState,
+}));
+
+jest.mock('../services/aidCache', () => ({
+  clearAidCache: jest.fn().mockResolvedValue({ items: [] }),
+  getAidCacheSummary: jest.fn().mockResolvedValue({
+    sizeBytes: 1024,
+    maxBytes: 4096,
+    itemCount: 2,
+    isNearLimit: false,
+    isOverLimit: false,
+    warningRatio: 0.8,
+  }),
+}));
+
+jest.mock('../services/taskCache', () => ({
+  clearTaskCache: jest.fn().mockResolvedValue({ items: [] }),
+  getTaskCacheSummary: jest.fn().mockResolvedValue({
+    sizeBytes: 512,
+    maxBytes: 2048,
+    itemCount: 1,
+    isNearLimit: false,
+    isOverLimit: false,
+    warningRatio: 0.8,
+  }),
+}));
+
 describe('SettingsScreen', () => {
   beforeEach(() => {
     (config as { network: 'testnet' | 'mainnet' }).network = 'testnet';
@@ -53,10 +128,34 @@ describe('SettingsScreen', () => {
       isOnCorrectNetwork: false,
       status: 'idle',
     };
+    mockSyncFrequency = 'normal';
+    mockSetSyncFrequency.mockClear();
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('shows sync frequency controls with options', () => {
+    const { getByText } = render(<SettingsScreen />);
+
+    expect(getByText('Sync Frequency')).toBeTruthy();
+    expect(getByText('Aggressive')).toBeTruthy();
+    expect(getByText('Normal')).toBeTruthy();
+    expect(getByText('Conservative')).toBeTruthy();
+  });
+
+  it('changes sync frequency when frequency chips are pressed', () => {
+    const { getByText } = render(<SettingsScreen />);
+
+    fireEvent.press(getByText('Conservative'));
+    expect(mockSetSyncFrequency).toHaveBeenCalledWith('conservative');
+
+    fireEvent.press(getByText('Aggressive'));
+    expect(mockSetSyncFrequency).toHaveBeenCalledWith('aggressive');
+
+    fireEvent.press(getByText('Normal'));
+    expect(mockSetSyncFrequency).toHaveBeenCalledWith('normal');
   });
 
   it('shows official faucet links on testnet', () => {
@@ -82,6 +181,15 @@ describe('SettingsScreen', () => {
 
     expect(queryByText('Get Testnet XLM')).toBeNull();
     expect(queryByText('Stellar Lab faucet')).toBeNull();
+  });
+
+  it('shows offline cache usage and clear action', async () => {
+    const { findByText, getByText } = render(<SettingsScreen />);
+
+    expect(await findByText('Offline Storage')).toBeTruthy();
+    expect(getByText('Aid cache')).toBeTruthy();
+    expect(getByText('Task cache')).toBeTruthy();
+    expect(getByText('Clear synced cache')).toBeTruthy();
   });
 
   describe('when wallet is connected on testnet', () => {

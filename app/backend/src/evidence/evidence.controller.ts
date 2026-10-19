@@ -263,7 +263,10 @@ export class EvidenceController {
     @Param('id') id: string,
     @Request() req: ExpressRequest,
   ) {
-    const tokenPayload = req['artifactToken'];
+    const tokenPayload = req['artifactToken'] as {
+      artifactId: string;
+      userId: string;
+    };
 
     // Additional validation: ensure token artifact ID matches URL
     if (tokenPayload.artifactId !== id) {
@@ -288,7 +291,9 @@ export class EvidenceController {
 
     return {
       artifactId: artifactItem.id,
-      filePath: artifactItem.filePath,
+      storageKey: artifactItem.storageKey,
+      // Retained for backward compatibility with older clients.
+      filePath: artifactItem.storageKey,
       metadata: artifactItem.metadata,
       accessedAt: new Date().toISOString(),
       accessedBy: tokenPayload.userId,

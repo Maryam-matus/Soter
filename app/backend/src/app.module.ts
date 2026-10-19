@@ -27,6 +27,7 @@ import { RolesGuard } from './auth/roles.guard';
 import { ScopesGuard } from './api-keys/scopes.guard';
 import { ObservabilityModule } from './observability/observability.module';
 import { ClaimsModule } from './claims/claims.module';
+import { ClaimVerificationModule } from './claims/claim-verification.module';
 import { LoggingInterceptor } from './interceptors/logging.interceptor';
 import { LoggerService } from './logger/logger.service';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
@@ -39,6 +40,7 @@ import { ApiKeysModule } from './api-keys/api-keys.module';
 import { SessionModule } from './session/session.module';
 import { CommonServicesModule } from './common/services/common-services.module';
 import { EvidenceModule } from './evidence/evidence.module';
+import { StorageModule } from './evidence/storage/storage.module';
 import { RetentionPolicyModule } from './retention-policy/retention-policy.module';
 import { InvitesModule } from './orgs/invites.module';
 import { AdminSearchModule } from './search/admin-search.module';
@@ -47,6 +49,7 @@ import { DeploymentMetadataModule } from './deployment-metadata/deployment-metad
 import { ReleaseConfigModule } from './release-config/release-config.module';
 import { RedisModule } from './redis/redis.module';
 import { AdaptiveRateLimitGuard } from './common/guards/adaptive-rate-limit.guard';
+import { ApiKeyRateLimitGuard } from './common/guards/api-key-rate-limit.guard';
 import { DeprecationInterceptor } from './common/interceptors/deprecation.interceptor';
 import { SandboxModule } from './sandbox/sandbox.module';
 import { CacheModule } from './common/cache/cache.module';
@@ -57,13 +60,15 @@ import { WebhooksModule } from 'src/webhooks.module';
 import { CorrelationModule } from './common/modules/correlation.module';
 import { RecipientImportModule } from './recipient-import/recipient-import.module';
 import { DeviceTokensModule } from './device-tokens/device-tokens.module';
-import { validateNetworkConfig } from './config/network-config.validation';
+import { validateAppConfig } from './config/validation';
+
+const skipBackgroundJobs = process.env.SKIP_BACKGROUND_JOBS === 'true';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      validate: validateNetworkConfig,
+      validate: validateAppConfig,
       envFilePath: (() => {
         const candidates = [
           join(__dirname, '..', '.env'),
@@ -76,35 +81,43 @@ import { validateNetworkConfig } from './config/network-config.validation';
       })(),
     }),
 
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>('REDIS_HOST') ?? 'localhost',
-          port: parseInt(configService.get<string>('REDIS_PORT') ?? '6379', 10),
-        },
-        defaultJobOptions: {
-          attempts: 3,
-          backoff: {
-            type: 'exponential',
-            delay: 5000,
-          },
-          removeOnComplete: {
-            age: 3600, // keep for 1 hour
-            count: 1000,
-          },
-          removeOnFail: {
-            age: 24 * 3600, // keep for 24 hours
-            count: 5000,
-          },
-        },
-      }),
-      inject: [ConfigService],
-    }),
+    ...(skipBackgroundJobs
+      ? []
+      : [
+          BullModule.forRootAsync({
+            imports: [ConfigModule],
+            useFactory: (configService: ConfigService) => ({
+              connection: {
+                host: configService.get<string>('REDIS_HOST') ?? 'localhost',
+                port: parseInt(
+                  configService.get<string>('REDIS_PORT') ?? '6379',
+                  10,
+                ),
+              },
+              defaultJobOptions: {
+                attempts: 3,
+                backoff: {
+                  type: 'exponential',
+                  delay: 5000,
+                },
+                removeOnComplete: {
+                  age: 3600, // keep for 1 hour
+                  count: 1000,
+                },
+                removeOnFail: {
+                  age: 24 * 3600, // keep for 24 hours
+                  count: 5000,
+                },
+              },
+            }),
+            inject: [ConfigService],
+          }),
+        ]),
     ScheduleModule.forRoot(),
 
     LoggerModule,
     PrismaModule,
+    StorageModule,
     CacheModule,
     HealthModule,
     AidModule,
@@ -116,6 +129,7 @@ import { validateNetworkConfig } from './config/network-config.validation';
     RecipientsModule,
     ObservabilityModule,
     ClaimsModule,
+    ClaimVerificationModule,
     NotificationsModule,
     JobsModule,
     AnalyticsModule,
@@ -136,57 +150,65 @@ import { validateNetworkConfig } from './config/network-config.validation';
     RedisModule,
     RecipientImportModule,
     DeviceTokensModule,
-    ThrottlerModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: async (configService: ConfigService) => {
-        const redisHost =
-          configService.get<string>('REDIS_HOST') ?? 'localhost';
-        const redisPort = parseInt(
-          configService.get<string>('REDIS_PORT') ?? '6379',
-          10,
-        );
+    ...(skipBackgroundJobs
+      ? [
+          ThrottlerModule.forRoot({
+            throttlers: getThrottlerConfig(),
+          }),
+        ]
+      : [
+          ThrottlerModule.forRootAsync({
+            imports: [ConfigModule],
+            useFactory: async (configService: ConfigService) => {
+              const redisHost =
+                configService.get<string>('REDIS_HOST') ?? 'localhost';
+              const redisPort = parseInt(
+                configService.get<string>('REDIS_PORT') ?? '6379',
+                10,
+              );
 
-        // Try to use Redis storage for multi-instance compatibility
-        // Falls back to in-memory storage if Redis is unavailable
-        try {
-          const { createClient } = await import('redis');
-          const client = createClient({
-            socket: {
-              host: redisHost,
-              port: redisPort,
-              reconnectStrategy: (retries: number) => {
-                if (retries > 10) {
-                  console.warn(
-                    'ThrottlerModule: Failed to connect to Redis after 10 retries, falling back to in-memory storage',
-                  );
-                  return new Error(
-                    'Max retries exceeded for ThrottlerModule Redis',
-                  );
-                }
-                return retries * 50;
-              },
+              // Try to use Redis storage for multi-instance compatibility
+              // Falls back to in-memory storage if Redis is unavailable
+              try {
+                const { createClient } = await import('redis');
+                const client = createClient({
+                  socket: {
+                    host: redisHost,
+                    port: redisPort,
+                    reconnectStrategy: (retries: number) => {
+                      if (retries > 10) {
+                        console.warn(
+                          'ThrottlerModule: Failed to connect to Redis after 10 retries, falling back to in-memory storage',
+                        );
+                        return new Error(
+                          'Max retries exceeded for ThrottlerModule Redis',
+                        );
+                      }
+                      return retries * 50;
+                    },
+                  },
+                });
+
+                await client.connect();
+
+                return {
+                  throttlers: getThrottlerConfig(),
+                  storage: new ThrottlerStorageService(),
+                };
+              } catch (error) {
+                console.warn(
+                  'ThrottlerModule: Redis unavailable, using in-memory storage',
+                  error instanceof Error ? error.message : error,
+                );
+                // Fall back to in-memory storage for local development
+                return {
+                  throttlers: getThrottlerConfig(),
+                };
+              }
             },
-          });
-
-          await client.connect();
-
-          return {
-            throttlers: getThrottlerConfig(),
-            storage: new ThrottlerStorageService(),
-          };
-        } catch (error) {
-          console.warn(
-            'ThrottlerModule: Redis unavailable, using in-memory storage',
-            error instanceof Error ? error.message : error,
-          );
-          // Fall back to in-memory storage for local development
-          return {
-            throttlers: getThrottlerConfig(),
-          };
-        }
-      },
-      inject: [ConfigService],
-    }),
+            inject: [ConfigService],
+          }),
+        ]),
   ],
 
   controllers: [AppController],
@@ -208,6 +230,10 @@ import { validateNetworkConfig } from './config/network-config.validation';
     {
       provide: APP_GUARD,
       useClass: ScopesGuard, // runs third — checks request.user.scopes against @Scopes()
+    },
+    {
+      provide: APP_GUARD,
+      useClass: ApiKeyRateLimitGuard, // runs fourth — per-API-key rate limiting (issue #952)
     },
     {
       provide: APP_GUARD,

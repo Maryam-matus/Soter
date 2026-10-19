@@ -1,11 +1,117 @@
-import { BadRequestException } from '@nestjs/common';
+import { AppException } from '../common/dto/error-response.dto';
+import { RecipientRemovalReasonCode } from '@prisma/client';
+import { DeepMockProxy, mockDeep } from 'jest-mock-extended';
+import { PrismaService } from '../prisma/prisma.service';
+import { validateSync } from 'class-validator';
+import { RecipientRemovalDto } from './dto/recipient-removal.dto';
 import { RecipientsService } from './recipients.service';
 
 describe('RecipientsService', () => {
   let service: RecipientsService;
+  let prisma: DeepMockProxy<PrismaService>;
 
   beforeEach(() => {
-    service = new RecipientsService();
+    prisma = mockDeep<PrismaService>();
+    service = new RecipientsService(prisma);
+  });
+
+  describe('remove', () => {
+    it('requires a reason code in the request DTO', () => {
+      const dto = new RecipientRemovalDto();
+      expect(
+        validateSync(dto).some(error => error.property === 'reasonCode'),
+      ).toBe(true);
+    });
+
+    it('records the actor, reason and recipient reference without mutating claims', async () => {
+      const removal = {
+        id: 'removal-1',
+        recipientRef: 'recipient-123',
+        ngoId: 'ngo-1',
+        reasonCode: RecipientRemovalReasonCode.ineligible,
+        reason: 'Eligibility ended',
+        removedBy: 'operator-1',
+        removedAt: new Date('2026-10-18T10:00:00.000Z'),
+      };
+      prisma.recipientRemoval.create.mockResolvedValue(removal);
+
+      const result = await service.remove(
+        ' recipient-123 ',
+        RecipientRemovalReasonCode.ineligible,
+        ' Eligibility ended ',
+        ' operator-1 ',
+        'ngo-1',
+      );
+
+      expect(result).toEqual(removal);
+      expect(prisma.recipientRemoval.create).toHaveBeenCalledWith({
+        data: {
+          recipientRef: 'recipient-123',
+          ngoId: 'ngo-1',
+          reasonCode: RecipientRemovalReasonCode.ineligible,
+          reason: 'Eligibility ended',
+          removedBy: 'operator-1',
+        },
+      });
+      expect(prisma.claim.update).not.toHaveBeenCalled();
+      expect(prisma.claim.delete).not.toHaveBeenCalled();
+    });
+
+    it('rejects a missing recipient reference or actor', async () => {
+      await expect(
+        service.remove(
+          '  ',
+          RecipientRemovalReasonCode.other,
+          undefined,
+          'actor',
+        ),
+      ).rejects.toThrow(AppException);
+      await expect(
+        service.remove(
+          'recipient-123',
+          RecipientRemovalReasonCode.other,
+          undefined,
+          '  ',
+        ),
+      ).rejects.toThrow(AppException);
+      expect(prisma.recipientRemoval.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('findRemovals', () => {
+    it('returns independently queryable records with pagination and recipient filtering', async () => {
+      const removal = {
+        id: 'removal-1',
+        recipientRef: 'recipient-123',
+        ngoId: 'ngo-1',
+        reasonCode: RecipientRemovalReasonCode.ineligible,
+        reason: null,
+        removedBy: 'operator-1',
+        removedAt: new Date('2026-10-18T10:00:00.000Z'),
+      };
+      prisma.recipientRemoval.findMany.mockResolvedValue([removal]);
+      prisma.recipientRemoval.count.mockResolvedValue(1);
+
+      await expect(
+        service.findRemovals(
+          {
+            recipientRef: ' recipient-123 ',
+            page: 2,
+            limit: 10,
+          },
+          'ngo-1',
+        ),
+      ).resolves.toEqual({ data: [removal], total: 1, page: 2, limit: 10 });
+      expect(prisma.recipientRemoval.findMany).toHaveBeenCalledWith({
+        where: { recipientRef: 'recipient-123', ngoId: 'ngo-1' },
+        orderBy: [{ removedAt: 'desc' }, { id: 'desc' }],
+        skip: 10,
+        take: 10,
+      });
+      expect(prisma.recipientRemoval.count).toHaveBeenCalledWith({
+        where: { recipientRef: 'recipient-123', ngoId: 'ngo-1' },
+      });
+    });
   });
 
   describe('validateImport', () => {
@@ -27,21 +133,39 @@ describe('RecipientsService', () => {
       });
       expect(outcome.rows[0].status).toBe('valid');
       expect(outcome.rows[1].messages).toEqual([
-        { severity: 'error', field: 'wallet', message: 'Wallet address is required.' },
+        {
+          severity: 'error',
+          field: 'wallet',
+          message: 'Wallet address is required.',
+        },
       ]);
-      expect(outcome.rows[2].messages.map(m => m.field)).toEqual(['fullName', 'phone']);
+      expect(outcome.rows[2].messages.map(m => m.field)).toEqual([
+        'fullName',
+        'phone',
+      ]);
     });
 
     it('flags short wallet addresses as warnings', () => {
-      const outcome = service.validateImport('name,wallet,phone\nAlice,GCAB,123');
+      const outcome = service.validateImport(
+        'name,wallet,phone\nAlice,GCAB,123',
+      );
       expect(outcome.rows[0].status).toBe('warning');
-      expect(outcome.rows[0].messages[0]).toMatchObject({ severity: 'warning', field: 'wallet' });
+      expect(outcome.rows[0].messages[0]).toMatchObject({
+        severity: 'warning',
+        field: 'wallet',
+      });
     });
 
     it('recognises aliased headers', () => {
-      const outcome = service.validateImport('Full Name,Wallet Address,Mobile\nAlice,GABCDEFGHIJKLM,123');
+      const outcome = service.validateImport(
+        'Full Name,Wallet Address,Mobile\nAlice,GABCDEFGHIJKLM,123',
+      );
       expect(outcome.rows[0].status).toBe('valid');
-      expect(outcome.rows[0].values).toEqual({ name: 'Alice', wallet: 'GABCDEFGHIJKLM', phone: '123' });
+      expect(outcome.rows[0].values).toEqual({
+        name: 'Alice',
+        wallet: 'GABCDEFGHIJKLM',
+        phone: '123',
+      });
     });
 
     it('handles CRLF line endings and BOM', () => {
@@ -52,12 +176,12 @@ describe('RecipientsService', () => {
     });
 
     it('rejects empty input', () => {
-      expect(() => service.validateImport('')).toThrow(BadRequestException);
-      expect(() => service.validateImport('   \n  ')).toThrow(BadRequestException);
+      expect(() => service.validateImport('')).toThrow(AppException);
+      expect(() => service.validateImport('   \n  ')).toThrow(AppException);
     });
 
     it('rejects files without headers', () => {
-      expect(() => service.validateImport(',,,')).toThrow(BadRequestException);
+      expect(() => service.validateImport(',,,')).toThrow(AppException);
     });
   });
 
@@ -82,16 +206,26 @@ describe('RecipientsService', () => {
       expect(lines).toContain('# source: backend');
       expect(lines).toContain('# totalRows: 3');
       expect(lines).toContain('# errorRows: 1');
-      expect(lines).toContain('rowNumber,status,severity,field,message,name,wallet,phone');
+      expect(lines).toContain(
+        'rowNumber,status,severity,field,message,name,wallet,phone',
+      );
 
       // Row 2 has a missing wallet → one error record.
-      expect(lines).toContain('2,error,error,wallet,Wallet address is required.,Bob,,08087654321');
+      expect(lines).toContain(
+        '2,error,error,wallet,Wallet address is required.,Bob,,08087654321',
+      );
       // Row 3 message contains quotes → value is CSV-escaped.
-      expect(lines.some(line => line.startsWith('3,') && line.includes('"Needs ""Quotes"""'))).toBe(true);
+      expect(
+        lines.some(
+          line => line.startsWith('3,') && line.includes('"Needs ""Quotes"""'),
+        ),
+      ).toBe(true);
     });
 
     it('emits a single record for rows without messages', () => {
-      const outcome = service.validateImport('name,wallet,phone\nAlice,GABCDEFGHIJKLM,123');
+      const outcome = service.validateImport(
+        'name,wallet,phone\nAlice,GABCDEFGHIJKLM,123',
+      );
       const report = service.buildImportReport('camp-1', outcome);
       const body = report.csv.split('\n').filter(line => line.startsWith('1,'));
       expect(body).toEqual(['1,valid,,,,Alice,GABCDEFGHIJKLM,123']);

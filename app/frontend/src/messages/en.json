@@ -127,7 +127,12 @@
     "transactionHistory": "Transaction History",
     "networkMismatch": "Network mismatch — your wallet is on {walletNetwork} but this app requires {expectedNetwork}. Open Freighter and switch to the correct network to continue.",
     "networkMismatchShort": "Wrong network — switch to {expectedNetwork} in Freighter.",
-    "submitBlocked": "Cannot submit: wallet is on the wrong network."
+    "submitBlocked": "Cannot submit: wallet is on the wrong network.",
+    "refreshSession": "I switched — refresh",
+    "refreshingSession": "Refreshing…",
+    "refreshSessionLabel": "Re-read network from Freighter after switching",
+    "disconnectAndReconnect": "Disconnect & reconnect",
+    "disconnectToReconnectLabel": "Disconnect wallet so you can reconnect on the correct network"
   },
   "errors": {
     "generic": "An unexpected error occurred. Please try again.",
@@ -135,7 +140,37 @@
     "validationError": "Please check your input and try again.",
     "unauthorized": "You are not authorized to perform this action.",
     "notFound": "The requested resource was not found.",
-    "serverError": "Server error. Please try again later."
+    "serverError": "Server error. Please try again later.",
+    "AI_SERVICE_UNAVAILABLE": "The AI service is temporarily unavailable. Please try again later.",
+    "AI_SERVICE_TIMEOUT": "The AI service took too long to respond. Please try again.",
+    "AI_INVALID_RESPONSE": "The AI service returned an unexpected response.",
+    "AI_QUOTA_EXCEEDED": "The AI service is currently busy due to high demand.",
+    "AI_VERIFICATION_FAILED": "Verification failed to complete. Please try manual review.",
+    "ONCHAIN_NETWORK_UNREACHABLE": "Unable to reach the Stellar network.",
+    "ONCHAIN_TRANSACTION_TIMEOUT": "The transaction timed out.",
+    "ONCHAIN_TRANSACTION_FAILED": "The transaction failed on-chain.",
+    "ONCHAIN_CONTRACT_ERROR": "The smart contract rejected the operation.",
+    "ONCHAIN_INSUFFICIENT_FUNDS": "Insufficient funds in the escrow contract.",
+    "ONCHAIN_PACKAGE_NOT_FOUND": "The specified aid package was not found.",
+    "ONCHAIN_PACKAGE_EXPIRED": "This aid package has expired.",
+    "ONCHAIN_INVALID_STATE": "The package is in an invalid state for this operation.",
+    "ONCHAIN_NOT_AUTHORIZED": "You are not authorized to perform this on-chain operation.",
+    "ONCHAIN_CONTRACT_PAUSED": "The contract is currently paused.",
+    "ONCHAIN_TOKEN_TRANSFER_FAILED": "Token transfer failed.",
+    "ONCHAIN_RPC_ERROR": "Blockchain RPC error.",
+    "EVIDENCE_UPLOAD_FAILED": "Failed to upload evidence.",
+    "EVIDENCE_INVALID_FILE_TYPE": "Invalid evidence file type.",
+    "EVIDENCE_FILE_TOO_LARGE": "The evidence file is too large.",
+    "EVIDENCE_MISSING_FILE": "Evidence file is missing.",
+    "EVIDENCE_NOT_FOUND": "Evidence not found.",
+    "EVIDENCE_ACCESS_DENIED": "Access to evidence denied.",
+    "EVIDENCE_CORRUPT_FILE": "The evidence file appears to be corrupted.",
+    "WEBHOOK_DUPLICATE_EVENT": "Duplicate webhook event.",
+    "WEBHOOK_SESSION_NOT_FOUND": "Webhook session not found.",
+    "WEBHOOK_STEP_NOT_FOUND": "Webhook step not found.",
+    "WEBHOOK_INVALID_SIGNATURE": "Invalid webhook signature.",
+    "WEBHOOK_DELIVERY_FAILED": "Webhook delivery failed.",
+    "WEBHOOK_INVALID_PAYLOAD": "Invalid webhook payload."
   },
   "status": {
     "pending": "Pending",
@@ -277,9 +312,6 @@
     "registryContractId": "Contract ID",
     "registryDeployedVersion": "Deployed Version",
     "registryDeployedAt": "Deployed Date",
-    "registrySourceCanonical": "Canonical Output File",
-    "registrySourceGenerator": "Generator Script",
-    "registrySourceDeployment": "Deployment Registry",
     "registryCopyId": "Copy Contract ID",
     "registryCopied": "Copied to clipboard",
     "registryViewSource": "View Source",
@@ -294,7 +326,40 @@
     "tabAllSteps": "All Steps",
     "sectionProgress": "Section progress",
     "autoVerified": "Auto-verified",
-    "manual": "Manual check"
+    "manual": "Manual check",
+    "registryWasmHash": "WASM Hash"
+  },
+  "emptyStates": {
+    "campaigns": {
+      "eyebrow": "No Campaigns Yet",
+      "title": "Create your first campaign",
+      "description": "Your organization does not have any campaigns yet. Create a campaign to start funding aid distributions, or load sample values to explore the contributor workflow first.",
+      "createAction": "Create a campaign",
+      "sampleAction": "Load sample values",
+      "helpAction": "View help",
+      "sampleTip": "Load sample values in the form to generate realistic test content quickly.",
+      "helpTip": "Open Help for contributor setup notes, including mock mode and role-aware paths.",
+      "filtered": "No campaigns match the current filter."
+    },
+    "dashboard": {
+      "noPackages": {
+        "eyebrow": "No Packages Yet",
+        "operatorTitle": "No aid packages have been published yet",
+        "operatorDescription": "This workspace does not have package data yet. Create a campaign to publish aid packages and populate this dashboard.",
+        "viewerTitle": "No aid packages are available to browse yet",
+        "viewerDescription": "There is no live distribution data in this environment yet, but the verification and sample workflows are still available.",
+        "operatorAction": "Create a campaign",
+        "viewerAction": "Try verification flow",
+        "secondaryAction": "View help"
+      },
+      "noMatches": {
+        "eyebrow": "No Matches",
+        "title": "No aid packages match the current filters",
+        "description": "Try widening the search, clearing filters, or switching token and status selections.",
+        "resetAction": "Reset dashboard filters",
+        "secondaryAction": "View help"
+      }
+    }
   },
   "faucet": {
     "title": "Testnet Faucet Helper",

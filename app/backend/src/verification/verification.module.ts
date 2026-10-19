@@ -21,6 +21,9 @@ import { EncryptionModule } from '../common/encryption/encryption.module';
 import { JobsModule } from '../jobs/jobs.module';
 import { DeploymentMetadataModule } from '../deployment-metadata/deployment-metadata.module';
 import { MetricsModule } from '../observability/metrics/metrics.module';
+import { AnalyticsModule } from '../analytics/analytics.module';
+
+const skipBackgroundJobs = process.env.SKIP_BACKGROUND_JOBS === 'true';
 
 @Module({
   imports: [
@@ -30,20 +33,27 @@ import { MetricsModule } from '../observability/metrics/metrics.module';
     AuditModule,
     NotificationsModule,
     EncryptionModule,
-    BullModule.registerQueueAsync({
-      name: 'verification',
-      imports: [ConfigModule],
-      useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>('REDIS_HOST') || 'localhost',
-          port: parseInt(configService.get<string>('REDIS_PORT') || '6379'),
-        },
-      }),
-      inject: [ConfigService],
-    }),
+    ...(skipBackgroundJobs
+      ? []
+      : [
+          BullModule.registerQueueAsync({
+            name: 'verification',
+            imports: [ConfigModule],
+            useFactory: (configService: ConfigService) => ({
+              connection: {
+                host: configService.get<string>('REDIS_HOST') || 'localhost',
+                port: parseInt(
+                  configService.get<string>('REDIS_PORT') || '6379',
+                ),
+              },
+            }),
+            inject: [ConfigService],
+          }),
+        ]),
     JobsModule,
     DeploymentMetadataModule, // Added for contract-aware metadata
     MetricsModule, // Added for verification priority metrics
+    AnalyticsModule,
   ],
   controllers: [
     VerificationController,

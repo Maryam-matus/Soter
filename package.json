@@ -10,7 +10,15 @@
     "build": "pnpm run build --filter=app/frontend",
     "start": "pnpm run start --filter=app/frontend",
     "lint": "pnpm run lint --filter=app/frontend",
-    "test": "pnpm run test --filter=app/frontend"
+    "test": "pnpm run test --filter=app/frontend",
+    "generate:api": "npx ts-node -r tsconfig-paths/register -P app/backend/tsconfig.json tools/generate-openapi.cjs && npx openapi-typescript openapi.json -o app/mobile/src/types/generated/api.d.ts",
+    "spec:generate": "pnpm --dir app/backend run spec:generate",
+    "spec:check": "pnpm --dir app/backend run spec:check",
+    "spec:lint": "pnpm --dir app/backend run spec:lint",
+    "contract:export": "pnpm --dir app/backend run contract:export",
+    "contract:generate": "pnpm --dir app/backend run contract:generate",
+    "contract:check": "pnpm --dir app/backend run contract:check",
+    "contract:check:wasm": "pnpm --dir app/backend run contract:check:wasm"
   },
   "devDependencies": {
     "@prisma/client": "^7.4.1",
@@ -23,6 +31,7 @@
     "i": "^0.3.7",
     "jest": "^29.7.0",
     "npm": "^11.10.1",
+    "openapi-typescript": "^7.13.0",
     "prisma": "^7.4.1",
     "supertest": "^7.2.2",
     "ts-jest": "^29.4.11",
@@ -38,44 +47,6 @@
     "redis": "^5.12.1",
     "socket.io-client": "^4.8.3"
   },
-  "overrides": {
-    "jest": "29.7.0",
-    "jest-environment-jsdom": "29.7.0",
-    "jest-environment-node": "29.7.0",
-    "jest-runtime": "29.7.0",
-    "babel-jest": "29.7.0",
-    "@jest/core": "29.7.0",
-    "@jest/globals": "29.7.0",
-    "@jest/transform": "29.7.0",
-    "@jest/types": "29.6.3",
-    "@types/jest": "29.5.14",
-    "jest-util": "29.7.0"
-  },
-  "pnpm": {
-    "overrides": {
-      "jest": "29.7.0",
-      "jest-environment-jsdom": "29.7.0",
-      "jest-environment-node": "29.7.0",
-      "jest-runtime": "29.7.0",
-      "babel-jest": "29.7.0",
-      "@jest/core": "29.7.0",
-      "@jest/globals": "29.7.0",
-      "@jest/transform": "29.7.0",
-      "@jest/types": "29.6.3",
-      "@types/jest": "29.5.14",
-      "jest-util": "29.7.0"
-    },
-    "onlyBuiltDependencies": [
-      "@parcel/watcher",
-      "@prisma/engines",
-      "@scarf/scarf",
-      "@swc/core",
-      "msgpackr-extract",
-      "prisma",
-      "sharp",
-      "unrs-resolver"
-    ]
-  },
   "version": "1.0.0",
   "description": "<img width=\"1080\" height=\"1080\" alt=\"Gemini_Generated_Image_efez0kefez0kefez (1)\" src=\"https://github.com/user-attachments/assets/72250381-5090-45e4-9941-5096c190a000\" />[...],",
   "main": ".eslintrc.js",
@@ -90,5 +61,6 @@
   "bugs": {
     "url": "https://github.com/Truphile/Soter/issues"
   },
-  "homepage": "https://github.com/Truphile/Soter#readme"
+  "homepage": "https://github.com/Truphile/Soter#readme",
+  "packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"
 }

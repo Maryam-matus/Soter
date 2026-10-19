@@ -20,7 +20,9 @@ _ISOLATED_ENV_KEYS = (
     "PROOF_OF_LIFE_CONFIDENCE_THRESHOLD",
     "PROOF_OF_LIFE_MIN_FACE_SIZE",
     "LLM_TIMEOUT_SECONDS",
+    "PROVIDER_CAPABILITY_MATRIX",
     "CACHE_TTL_TASK_STATUS",
+    "ASYNC_JOB_IDLE_TIMEOUT_SECONDS",
     "PORT",
 )
 
@@ -133,6 +135,26 @@ def test_validate_configuration_passes_with_all_defaults():
     settings.validate_configuration()
 
 
+def test_async_job_idle_timeout_defaults_to_configurable_window(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+
+    assert settings.async_job_idle_timeout_seconds == 600.0
+    settings.validate_configuration()
+
+
+def test_non_positive_async_job_idle_timeout_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    monkeypatch.setenv("ASYNC_JOB_IDLE_TIMEOUT_SECONDS", "0")
+
+    settings = Settings(_env_file=None)
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    assert "ASYNC_JOB_IDLE_TIMEOUT_SECONDS" in str(excinfo.value)
+
+
 def test_missing_and_malformed_keys_reported_together(monkeypatch):
     _isolate_env(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "   ")
@@ -208,6 +230,154 @@ def test_missing_provider_in_production_names_every_option(monkeypatch):
     assert "OPENAI_API_KEY" in message
     assert "GROQ_API_KEY" in message
     assert "TEST_PROVIDER_MODE" in message
+
+
+def test_fallback_order_defaults_validate(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.validate_configuration()
+    assert settings.get_llm_fallback_order() == ["openai", "groq", "test"]
+    assert settings.get_ocr_fallback_order() == ["test", "tesseract"]
+
+
+def test_invalid_llm_fallback_order_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_provider_fallback_order = "openai,bogus"
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    message = str(excinfo.value)
+    assert "LLM_PROVIDER_FALLBACK_ORDER" in message
+    assert "bogus" in message
+
+
+def test_duplicate_llm_fallback_order_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_provider_fallback_order = "openai,openai"
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    assert "LLM_PROVIDER_FALLBACK_ORDER" in str(excinfo.value)
+
+
+def test_empty_llm_fallback_order_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_provider_fallback_order = ""
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    assert "LLM_PROVIDER_FALLBACK_ORDER" in str(excinfo.value)
+
+
+def test_invalid_provider_capability_matrix_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.provider_capability_matrix = {"openai": ["streaming"]}
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "PROVIDER_CAPABILITY_MATRIX" in str(excinfo.value)
+    assert "streaming" in str(excinfo.value)
+
+
+def test_provider_cost_ceiling_configuration_validates(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "groq": {
+            "limit_usd": 10.0,
+            "window": "daily",
+            "fallback_provider": "openai",
+        }
+    }
+    config.validate_configuration()
+
+
+def test_more_expensive_provider_fallback_is_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "openai": {
+            "limit_usd": 10.0,
+            "window": "daily",
+            "fallback_provider": "groq",
+        }
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "must have lower configured token rates" in str(excinfo.value)
+
+
+def test_invalid_provider_cost_ceiling_is_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    config = Settings(_env_file=None)
+    config.llm_provider_cost_ceilings = {
+        "openai": {"limit_usd": -1, "window": "weekly"}
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        config.validate_configuration()
+
+    assert "LLM_PROVIDER_COST_CEILINGS" in str(excinfo.value)
+
+
+def test_default_llm_model_cost_rates_validate(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.validate_configuration()
+    assert "gpt-4o-mini" in settings.llm_model_cost_per_1k_tokens
+    assert "llama-3.3-70b-versatile" in settings.llm_model_cost_per_1k_tokens
+
+
+def test_negative_llm_model_cost_rate_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_model_cost_per_1k_tokens = {
+        "some-model": {"prompt": -0.001, "completion": 0.002},
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    message = str(excinfo.value)
+    assert "LLM_MODEL_COST_PER_1K_TOKENS" in message
+    assert "some-model" in message
+    assert "prompt" in message
+
+
+def test_llm_model_cost_rate_missing_direction_rejected(monkeypatch):
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_model_cost_per_1k_tokens = {
+        "partial-model": {"prompt": 0.001},
+    }
+
+    with pytest.raises(ConfigurationError) as excinfo:
+        settings.validate_configuration()
+
+    message = str(excinfo.value)
+    assert "LLM_MODEL_COST_PER_1K_TOKENS" in message
+    assert "partial-model" in message
+    assert "completion" in message
+
+
+def test_empty_llm_model_cost_rates_still_validates(monkeypatch):
+    """An empty rate table is valid - it just means no model has a known
+    cost yet, not a configuration error (issue #981: an unrated model
+    results in no cost estimate, not a validation failure)."""
+    _isolate_env(monkeypatch)
+    settings = Settings(_env_file=None)
+    settings.llm_model_cost_per_1k_tokens = {}
+    settings.validate_configuration()
 
 
 def test_boot_report_logs_defaults_at_debug_level(monkeypatch, caplog):

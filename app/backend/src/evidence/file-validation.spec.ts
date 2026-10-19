@@ -1,4 +1,5 @@
-import { BadRequestException, PayloadTooLargeException } from '@nestjs/common';
+import { PayloadTooLargeException } from '@nestjs/common';
+import { AppException } from '../common/dto/error-response.dto';
 import { Readable } from 'stream';
 import {
   ALLOWED_EXTENSIONS,
@@ -81,7 +82,7 @@ describe('validateUploadedFile', () => {
   });
 
   it('rejects a missing file', () => {
-    expect(() => validateUploadedFile(undefined)).toThrow(BadRequestException);
+    expect(() => validateUploadedFile(undefined)).toThrow(AppException);
   });
 
   it('rejects an empty file', () => {
@@ -132,7 +133,7 @@ describe('validateUploadedFile', () => {
         mimetype: 'application/octet-stream',
         buffer: Buffer.from('data'),
       });
-      expect(() => validateUploadedFile(file)).toThrow(BadRequestException);
+      expect(() => validateUploadedFile(file)).toThrow(AppException);
     });
 
     it('rejects a disallowed extension even with an allowed MIME', () => {
@@ -161,7 +162,7 @@ describe('validateUploadedFile', () => {
         mimetype: 'text/plain',
         buffer: elf,
       });
-      expect(() => validateUploadedFile(file)).toThrow(BadRequestException);
+      expect(() => validateUploadedFile(file)).toThrow(AppException);
     });
 
     it('rejects a PNG whose bytes are not actually a PNG', () => {
@@ -196,10 +197,8 @@ describe('validateUploadedFile', () => {
 describe('evidenceFileFilter', () => {
   const run = (file: Partial<Express.Multer.File>) =>
     new Promise<{ err: Error | null; accept: boolean }>(resolve => {
-      evidenceFileFilter(
-        {} as never,
-        file as Express.Multer.File,
-        (err, accept) => resolve({ err: err ? err : null, accept: !!accept }),
+      evidenceFileFilter({} as never, file, (err, accept) =>
+        resolve({ err: err ? err : null, accept: !!accept }),
       );
     });
 
@@ -217,7 +216,7 @@ describe('evidenceFileFilter', () => {
       originalname: 'evil.exe',
       mimetype: 'text/plain',
     });
-    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err).toBeInstanceOf(AppException);
     expect(accept).toBe(false);
   });
 
@@ -226,7 +225,7 @@ describe('evidenceFileFilter', () => {
       originalname: 'note.txt',
       mimetype: 'application/x-msdownload',
     });
-    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err).toBeInstanceOf(AppException);
     expect(accept).toBe(false);
   });
 
@@ -235,7 +234,7 @@ describe('evidenceFileFilter', () => {
       originalname: '../escape.txt',
       mimetype: 'text/plain',
     });
-    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err).toBeInstanceOf(AppException);
     expect(accept).toBe(false);
   });
 });

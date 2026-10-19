@@ -35,6 +35,7 @@ from api.routes import router as ocr_router
 from api.v1.router import v1_router
 
 from config import settings
+from request_limits import RequestSizeLimitMiddleware, clamp_request_timeout
 import tasks
 from proof_of_life import ProofOfLifeAnalyzer, ProofOfLifeConfig
 from schemas.anonymization import AnonymizeRequest, AnonymizeResponse
@@ -45,6 +46,7 @@ from schemas.humanitarian import (
 )
 from services.humanitarian_verification import HumanitarianVerificationService
 from services.evidence_access_control import EvidenceAccessControl
+from services.decision_audit import build_store_from_settings, set_store
 
 # Context variable for correlation ID
 correlation_id_var: ContextVar[str] = ContextVar("correlation_id", default="")
@@ -140,12 +142,61 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Response caching disabled (Redis unavailable)")
 
+    cost_ceilings = getattr(settings, "llm_provider_cost_ceilings", {})
+    if cost_ceilings and not app.state.cache.enabled:
+        raise RuntimeError(
+            "LLM provider cost ceilings require Redis; refusing to start without shared spend tracking"
+        )
+    if cost_ceilings:
+        humanitarian_verification_service.cost_ceiling.set_redis_client(
+            app.state.cache.client
+        )
+        for provider in cost_ceilings:
+            humanitarian_verification_service.cost_ceiling.current_spend(provider)
+
     # Expose the long-lived collaboration/AIService collaborators on app state
     # so versioned routers can resolve them via ``request.app.state`` instead of
     # importing private globals from this module.  Tests inject Mocks onto the
     # same keys via TestClient.app.state.
     app.state.artifact_access_control = evidence_access_control
     app.state.humanitarian_verification_service = humanitarian_verification_service
+    app.state.rate_limiter = rate_limiter
+
+    # Initialize organization rate limiting with configured tiers and key mappings
+    from services.org_rate_limiter import org_rate_limiter, api_key_org_mapping
+
+    # Load organization tier configuration from settings
+    if settings.org_rate_limit_tiers:
+        for org_id, limit_str in settings.org_rate_limit_tiers.items():
+            org_rate_limiter.set_organization_tier(org_id, limit_str)
+        logger.info(
+            f"Loaded {len(settings.org_rate_limit_tiers)} organization rate limit tiers"
+        )
+
+    # Load API key to organization mappings from settings
+    if settings.api_key_to_org_mapping:
+        api_key_org_mapping.set_batch_mapping(settings.api_key_to_org_mapping)
+        logger.info(
+            f"Loaded {len(settings.api_key_to_org_mapping)} API key to organization mappings"
+        )
+
+    app.state.org_rate_limiter = org_rate_limiter
+    app.state.api_key_org_mapping = api_key_org_mapping
+    # Re-assert the decision audit store (issue #990) and apply the retention
+    # policy once at startup, so an instance that was down past the retention
+    # window compacts its log before it starts serving.
+    app.state.decision_audit_store = decision_audit_store
+    if decision_audit_store is not None and decision_audit_store.enabled:
+        dropped = decision_audit_store.prune()
+        logger.info(
+            "Decision audit store ready: path=%s retention_days=%s records=%d expired_dropped=%d",
+            decision_audit_store.path,
+            settings.decision_audit_retention_days,
+            len(decision_audit_store),
+            dropped,
+        )
+    else:
+        logger.warning("Decision audit disabled (DECISION_AUDIT_ENABLED=false)")
     app.state.is_shutting_down = False
     app.state.active_requests = 0
 
@@ -172,6 +223,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Lets metrics.bounded_endpoint_label() resolve raw request paths to their
+# registered route templates (see metrics.py's cardinality guidance).
+metrics.bind_app(app)
+
+app.add_middleware(RequestSizeLimitMiddleware)
+
 proof_of_life_analyzer = ProofOfLifeAnalyzer(
     config=ProofOfLifeConfig(
         confidence_threshold=settings.proof_of_life_confidence_threshold,
@@ -184,6 +241,7 @@ humanitarian_verification_service = HumanitarianVerificationService()
 # Initialize evidence access control service
 from services.artifact_access import ArtifactAccessService
 from services.evidence_access_control import EvidenceAccessControl
+from services.rate_limiter import rate_limiter
 
 # Create artifact access service and wrap with evidence access control
 artifact_access_service_instance = ArtifactAccessService(
@@ -198,8 +256,24 @@ evidence_access_control = EvidenceAccessControl(artifact_access_service_instance
 # unless used as a context manager) both have these resolvable.  ``lifespan``
 # re-asserts the same references on startup so hot-reload / re-import
 # scenarios stay consistent.
+# Durable decision audit store (issue #990). Built at module-init time - like
+# the collaborators above - so ``TestClient(app)`` (which does not enter the
+# lifespan unless used as a context manager) can still audit decisions. It is
+# also published via ``set_store()`` so non-HTTP paths (Celery tasks) can reach
+# the same instance.
+try:
+    decision_audit_store = build_store_from_settings(settings)
+except Exception as _audit_exc:  # pragma: no cover - defensive
+    # A bad audit path must not stop the service from booting; the endpoints
+    # degrade to "no audit record" and log loudly instead.
+    logger.error("Failed to initialise decision audit store: %s", _audit_exc)
+    decision_audit_store = None
+set_store(decision_audit_store)
+
 app.state.humanitarian_verification_service = humanitarian_verification_service
 app.state.artifact_access_control = evidence_access_control
+app.state.rate_limiter = rate_limiter
+app.state.decision_audit_store = decision_audit_store
 
 
 class InferenceRequest(BaseModel):
@@ -451,6 +525,18 @@ async def monitor_requests(request: Request, call_next):
             ).model_dump(),
         )
 
+    from services.rate_limiter import evaluate_rate_limit
+
+    rate_limit_response = evaluate_rate_limit(request)
+    if rate_limit_response is not None:
+        return rate_limit_response
+
+    from services.org_rate_limiter import evaluate_org_rate_limit
+
+    org_rate_limit_response = evaluate_org_rate_limit(request)
+    if org_rate_limit_response is not None:
+        return org_rate_limit_response
+
     from services.load_shedder import evaluate_load_shed
 
     shed_response = evaluate_load_shed(request)
@@ -464,6 +550,13 @@ async def monitor_requests(request: Request, call_next):
     try:
         response = await call_next(request)
         status_code = response.status_code
+
+        # Attach rate limit metadata headers if present
+        rl_res = getattr(request.state, "rate_limit_result", None)
+        if rl_res is not None:
+            response.headers["X-RateLimit-Limit"] = str(rl_res.limit)
+            response.headers["X-RateLimit-Remaining"] = str(rl_res.remaining)
+            response.headers["X-RateLimit-Reset"] = str(rl_res.reset_seconds)
     except asyncio.CancelledError as e:
         status_code = 499
         logger.warning(f"Request {path} cancelled during shutdown. Dead-lettering.")
@@ -488,14 +581,18 @@ async def monitor_requests(request: Request, call_next):
         if hasattr(request.app.state, "active_requests"):
             request.app.state.active_requests -= 1
         latency = time.time() - start_time
+        # Bound the endpoint label to the matched route template so ids in
+        # the path (task/artifact/dead-letter-item ids) never become label
+        # values (see metrics.py's cardinality guidance, issue #988).
+        bounded_endpoint = metrics.bounded_endpoint_label(path)
         metrics.REQUEST_COUNT.labels(
             method=request.method,
-            endpoint=path,
+            endpoint=bounded_endpoint,
             http_status=status_code,
         ).inc()
-        metrics.REQUEST_LATENCY.labels(method=request.method, endpoint=path).observe(
-            latency
-        )
+        metrics.REQUEST_LATENCY.labels(
+            method=request.method, endpoint=bounded_endpoint
+        ).observe(latency)
 
         monitored_prefixes = ("/ai/", "/v1/ai/")
         if any(path.startswith(p) for p in monitored_prefixes):
@@ -520,6 +617,8 @@ async def get_metrics():
     """Endpoint for Prometheus metrics."""
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
+    for provider in settings.llm_provider_cost_ceilings:
+        humanitarian_verification_service.cost_ceiling.current_spend(provider)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -717,13 +816,14 @@ async def _legacy_verify_humanitarian_claim(request: HumanitarianVerificationReq
     logger.info("[legacy] Processing humanitarian verification request")
 
     try:
+        timeout = clamp_request_timeout(request.timeout, "/ai/humanitarian/verify")
         try:
             result = humanitarian_verification_service.verify_claim(
                 aid_claim=request.aid_claim,
                 supporting_evidence=request.supporting_evidence,
                 context_factors=request.context_factors,
                 provider_preference=request.provider_preference,
-                timeout=request.timeout,
+                timeout=timeout,
             )
         except TypeError as exc:
             if "timeout" in str(exc):
@@ -816,14 +916,22 @@ async def starlette_http_exception_handler(request, exc: StarletteHTTPException)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc: RequestValidationError):
-    logger.error(f"Validation error: {exc.errors()}")
+    errors = exc.errors()
+    for error in errors:
+        # Pydantic 2.x embeds the raw exception instance at ctx.error for
+        # ValueError-raising validators (e.g. model_validator). That's not
+        # JSON-serializable, so stringify it before it reaches JSONResponse.
+        ctx = error.get("ctx")
+        if ctx and "error" in ctx:
+            ctx["error"] = str(ctx["error"])
+    logger.error(f"Validation error: {errors}")
     return JSONResponse(
         status_code=422,
         content=ErrorEnvelope(
             error=ErrorDetail(
                 code="VALIDATION_ERROR",
                 message="Request validation failed",
-                details=exc.errors(),
+                details=errors,
             )
         ).model_dump(),
     )

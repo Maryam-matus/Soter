@@ -1,13 +1,10 @@
-import {
-  Injectable,
-  BadRequestException,
-  NotFoundException,
-  Logger,
-} from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import {
   ImportError,
+  ImportJobResumeState,
   ImportJobStatusResponse,
 } from './interfaces/import-job.interface';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -16,7 +13,7 @@ import { Queue } from 'bullmq';
 const BATCH_SIZE = 100;
 
 @Injectable()
-export class RecipientImportService {
+export class RecipientImportService implements OnModuleInit {
   private readonly logger = new Logger(RecipientImportService.name);
 
   constructor(
@@ -25,6 +22,13 @@ export class RecipientImportService {
     @InjectQueue('recipient-import')
     private readonly recipientImportQueue: Queue,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    if (process.env.SKIP_BACKGROUND_JOBS === 'true') {
+      return;
+    }
+    await this.resumeInterruptedJobs();
+  }
 
   async createJob(
     campaignId: string,
@@ -36,17 +40,26 @@ export class RecipientImportService {
       where: { id: campaignId },
     });
     if (!campaign) {
-      throw new BadRequestException('Campaign not found');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Campaign not found',
+      );
     }
 
     if (totalRows <= 0) {
-      throw new BadRequestException('CSV file contains no data rows');
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'CSV file contains no data rows',
+      );
     }
 
     const job = await this.prisma.importJob.create({
       data: {
         campaignId,
         fileName,
+        filePath,
         totalRows,
         status: 'pending',
       },
@@ -87,7 +100,11 @@ export class RecipientImportService {
     });
 
     if (!job) {
-      throw new NotFoundException(`Import job ${jobId} not found`);
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        `Import job ${jobId} not found`,
+      );
     }
 
     const progress =
@@ -95,14 +112,7 @@ export class RecipientImportService {
         ? Math.round((job.processedRows / job.totalRows) * 100)
         : 0;
 
-    let errors: ImportError[] | null = null;
-    if (job.errors) {
-      try {
-        errors = JSON.parse(job.errors) as ImportError[];
-      } catch {
-        errors = null;
-      }
-    }
+    const parsedErrors = this.parseErrors(job.errors);
 
     return {
       id: job.id,
@@ -111,12 +121,15 @@ export class RecipientImportService {
       totalRows: job.totalRows,
       processedRows: job.processedRows,
       errorRows: job.errorRows,
-      errors,
+      checkpointRow: job.checkpointRow,
+      errors: parsedErrors.length > 0 ? parsedErrors : null,
       reportUrl: job.reportUrl,
       fileName: job.fileName,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
+      startedAt: job.startedAt,
       completedAt: job.completedAt,
+      cancelledAt: job.cancelledAt,
       progress,
     };
   }
@@ -132,6 +145,7 @@ export class RecipientImportService {
       data: {
         processedRows,
         errorRows,
+        checkpointRow: processedRows,
         errors: errors.length > 0 ? JSON.stringify(errors) : null,
       },
     });
@@ -143,8 +157,9 @@ export class RecipientImportService {
     errorRows: number,
     errors: ImportError[],
     reportUrl: string | null,
+    statusOverride?: 'completed' | 'failed',
   ): Promise<void> {
-    const status = errorRows > 0 ? 'failed' : 'completed';
+    const status = statusOverride ?? (errorRows > 0 ? 'failed' : 'completed');
 
     await this.prisma.importJob.update({
       where: { id: jobId },
@@ -152,6 +167,7 @@ export class RecipientImportService {
         status,
         processedRows,
         errorRows,
+        checkpointRow: processedRows,
         errors: errors.length > 0 ? JSON.stringify(errors) : null,
         reportUrl,
         completedAt: new Date(),
@@ -171,17 +187,132 @@ export class RecipientImportService {
     );
   }
 
-  async setJobProcessing(jobId: string): Promise<void> {
-    await this.prisma.importJob.update({
-      where: { id: jobId },
-      data: { status: 'processing' },
+  async setJobProcessing(jobId: string): Promise<boolean> {
+    const result = await this.prisma.importJob.updateMany({
+      where: { id: jobId, status: { not: 'cancelled' } },
+      data: { status: 'processing', startedAt: new Date() },
     });
+
+    return result.count > 0;
+  }
+
+  async getResumeState(jobId: string): Promise<ImportJobResumeState> {
+    const job = await this.prisma.importJob.findUnique({
+      where: { id: jobId },
+    });
+    if (!job) {
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        `Import job ${jobId} not found`,
+      );
+    }
+
+    return {
+      id: job.id,
+      status: job.status,
+      campaignId: job.campaignId,
+      fileName: job.fileName,
+      filePath: job.filePath,
+      totalRows: job.totalRows,
+      processedRows: job.processedRows,
+      errorRows: job.errorRows,
+      checkpointRow: job.checkpointRow,
+      errors: this.parseErrors(job.errors),
+    };
+  }
+
+  async hasImportedRow(jobId: string, rowNumber: number): Promise<boolean> {
+    const existing = await this.prisma.claim.findFirst({
+      where: { importJobId: jobId, importRowNumber: rowNumber },
+      select: { id: true },
+    });
+    return !!existing;
+  }
+
+  async isCancellationRequested(jobId: string): Promise<boolean> {
+    const job = await this.prisma.importJob.findUnique({
+      where: { id: jobId },
+      select: { status: true },
+    });
+    return job?.status === 'cancelled';
+  }
+
+  async cancelJob(jobId: string): Promise<ImportJobStatusResponse> {
+    const job = await this.prisma.importJob.findUnique({
+      where: { id: jobId },
+    });
+    if (!job) {
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        `Import job ${jobId} not found`,
+      );
+    }
+
+    if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
+      const queuedJob = await this.recipientImportQueue.getJob(jobId);
+      if (queuedJob) {
+        try {
+          await queuedJob.remove();
+        } catch {
+          // Active jobs cannot be removed; the processor checks cancellation before each row.
+        }
+      }
+
+      await this.prisma.importJob.update({
+        where: { id: jobId },
+        data: {
+          status: 'cancelled',
+          cancelledAt: new Date(),
+          completedAt: new Date(),
+        },
+      });
+
+      await this.auditService.record({
+        actorId: 'system',
+        entity: 'ImportJob',
+        entityId: jobId,
+        action: 'cancelled',
+        metadata: {
+          processedRows: job.processedRows,
+          errorRows: job.errorRows,
+          checkpointRow: job.checkpointRow,
+        },
+      });
+    }
+
+    return this.getJobStatus(jobId);
+  }
+
+  async resumeInterruptedJobs(): Promise<void> {
+    const interruptedJobs = await this.prisma.importJob.findMany({
+      where: { status: 'processing' },
+    });
+
+    for (const job of interruptedJobs) {
+      if (!job.filePath) {
+        continue;
+      }
+
+      await this.recipientImportQueue.add(
+        'process-import',
+        {
+          jobId: job.id,
+          campaignId: job.campaignId,
+          fileName: job.fileName,
+          filePath: job.filePath,
+          totalRows: job.totalRows,
+        },
+        { jobId: job.id },
+      );
+    }
   }
 
   parseCsv(content: string): { headers: string[]; rows: string[][] } {
     const lines = content.split(/\r?\n/).filter(line => line.trim() !== '');
     if (lines.length === 0) {
-      throw new BadRequestException('CSV file is empty');
+      throw new AppException(ERROR_CODES.BAD_REQUEST, 400, 'CSV file is empty');
     }
 
     const headers = this.parseCsvLine(lines[0]);
@@ -299,6 +430,18 @@ export class RecipientImportService {
     return result;
   }
 
+  private parseErrors(rawErrors: string | null): ImportError[] {
+    if (!rawErrors) {
+      return [];
+    }
+
+    try {
+      return JSON.parse(rawErrors) as ImportError[];
+    } catch {
+      return [];
+    }
+  }
+
   getBatchSize(): number {
     return BATCH_SIZE;
   }
@@ -309,17 +452,14 @@ export class RecipientImportService {
     });
 
     if (!job) {
-      throw new NotFoundException(`Import job ${jobId} not found`);
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        `Import job ${jobId} not found`,
+      );
     }
 
-    let errors: ImportError[] = [];
-    if (job.errors) {
-      try {
-        errors = JSON.parse(job.errors) as ImportError[];
-      } catch {
-        errors = [];
-      }
-    }
+    const errors = this.parseErrors(job.errors);
 
     if (errors.length === 0) {
       return 'row,field,message,value\nNo errors found for this import.';

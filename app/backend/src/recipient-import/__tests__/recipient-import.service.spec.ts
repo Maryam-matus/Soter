@@ -1,5 +1,6 @@
+import { AppException } from '../../common/dto/error-response.dto';
 import { Test, TestingModule } from '@nestjs/testing';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+
 import { RecipientImportService } from '../recipient-import.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditService } from '../../audit/audit.service';
@@ -14,6 +15,7 @@ describe('RecipientImportService', () => {
 
   const mockQueue = {
     add: jest.fn().mockResolvedValue({ id: 'job-1' }),
+    getJob: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -37,14 +39,23 @@ describe('RecipientImportService', () => {
                 status: 'pending',
                 processedRows: 0,
                 errorRows: 0,
+                checkpointRow: 0,
                 errors: null,
                 reportUrl: null,
+                filePath: '/tmp/recipients.csv',
+                startedAt: null,
                 completedAt: null,
+                cancelledAt: null,
                 createdAt: new Date(),
                 updatedAt: new Date(),
               }),
               findUnique: jest.fn(),
               update: jest.fn().mockResolvedValue({}),
+              updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+              findMany: jest.fn().mockResolvedValue([]),
+            },
+            claim: {
+              findFirst: jest.fn(),
             },
           },
         },
@@ -83,6 +94,7 @@ describe('RecipientImportService', () => {
           data: expect.objectContaining({
             campaignId: 'campaign-1',
             fileName: 'recipients.csv',
+            filePath: '/tmp/recipients.csv',
             totalRows: 100,
           }),
         }),
@@ -94,13 +106,13 @@ describe('RecipientImportService', () => {
 
       await expect(
         service.createJob('non-existent', 'file.csv', '/tmp/file.csv', 10),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('should throw BadRequestException if totalRows is zero', async () => {
       await expect(
         service.createJob('campaign-1', 'file.csv', '/tmp/file.csv', 0),
-      ).rejects.toThrow(BadRequestException);
+      ).rejects.toThrow(AppException);
     });
 
     it('should record an audit log on creation', async () => {
@@ -124,12 +136,16 @@ describe('RecipientImportService', () => {
         totalRows: 100,
         processedRows: 50,
         errorRows: 5,
+        checkpointRow: 50,
         errors: JSON.stringify([
           { row: 1, field: 'amount', message: 'Invalid' },
         ]),
         reportUrl: null,
+        filePath: '/tmp/recipients.csv',
         status: 'processing',
+        startedAt: new Date(),
         completedAt: null,
+        cancelledAt: null,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -141,6 +157,7 @@ describe('RecipientImportService', () => {
       expect(result.totalRows).toBe(100);
       expect(result.processedRows).toBe(50);
       expect(result.errorRows).toBe(5);
+      expect(result.checkpointRow).toBe(50);
       expect(result.progress).toBe(50);
       expect(result.errors).toHaveLength(1);
     });
@@ -149,7 +166,7 @@ describe('RecipientImportService', () => {
       (prismaService.importJob.findUnique as jest.Mock).mockResolvedValue(null);
 
       await expect(service.getJobStatus('non-existent')).rejects.toThrow(
-        NotFoundException,
+        AppException,
       );
     });
 
@@ -161,10 +178,14 @@ describe('RecipientImportService', () => {
         totalRows: 0,
         processedRows: 0,
         errorRows: 0,
+        checkpointRow: 0,
         errors: null,
         reportUrl: null,
+        filePath: '/tmp/recipients.csv',
         status: 'pending',
+        startedAt: null,
         completedAt: null,
+        cancelledAt: null,
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -185,6 +206,7 @@ describe('RecipientImportService', () => {
         data: {
           processedRows: 75,
           errorRows: 3,
+          checkpointRow: 75,
           errors: JSON.stringify([
             { row: 1, field: 'amount', message: 'Invalid' },
           ]),
@@ -200,6 +222,7 @@ describe('RecipientImportService', () => {
         data: {
           processedRows: 100,
           errorRows: 0,
+          checkpointRow: 100,
           errors: null,
         },
       });
@@ -259,7 +282,7 @@ describe('RecipientImportService', () => {
     });
 
     it('should throw BadRequestException on empty CSV', () => {
-      expect(() => service.parseCsv('')).toThrow(BadRequestException);
+      expect(() => service.parseCsv('')).toThrow(AppException);
     });
   });
 
@@ -297,12 +320,118 @@ describe('RecipientImportService', () => {
 
   describe('setJobProcessing', () => {
     it('should update status to processing', async () => {
-      await service.setJobProcessing('import-job-1');
+      const result = await service.setJobProcessing('import-job-1');
 
+      expect(result).toBe(true);
+      expect(prismaService.importJob.updateMany).toHaveBeenCalledWith({
+        where: { id: 'import-job-1', status: { not: 'cancelled' } },
+        data: { status: 'processing', startedAt: expect.any(Date) },
+      });
+    });
+  });
+
+  describe('resume and cancellation', () => {
+    it('should return durable resume state', async () => {
+      (prismaService.importJob.findUnique as jest.Mock).mockResolvedValue({
+        id: 'import-job-1',
+        campaignId: 'campaign-1',
+        fileName: 'recipients.csv',
+        filePath: '/tmp/recipients.csv',
+        totalRows: 100,
+        processedRows: 40,
+        errorRows: 1,
+        checkpointRow: 40,
+        errors: JSON.stringify([
+          { row: 3, field: 'amount', message: 'Invalid' },
+        ]),
+        status: 'processing',
+      });
+
+      const result = await service.getResumeState('import-job-1');
+
+      expect(result.checkpointRow).toBe(40);
+      expect(result.errors).toHaveLength(1);
+      expect(result.filePath).toBe('/tmp/recipients.csv');
+    });
+
+    it('should detect an already imported row', async () => {
+      (prismaService.claim.findFirst as jest.Mock).mockResolvedValue({
+        id: 'claim-1',
+      });
+
+      await expect(service.hasImportedRow('import-job-1', 2)).resolves.toBe(
+        true,
+      );
+    });
+
+    it('should cancel a pending job and remove it from the queue', async () => {
+      const queuedJob = { remove: jest.fn().mockResolvedValue(undefined) };
+      mockQueue.getJob.mockResolvedValue(queuedJob);
+      (prismaService.importJob.findUnique as jest.Mock)
+        .mockResolvedValueOnce({
+          id: 'import-job-1',
+          status: 'pending',
+          processedRows: 10,
+          errorRows: 2,
+          checkpointRow: 10,
+        })
+        .mockResolvedValueOnce({
+          id: 'import-job-1',
+          campaignId: 'campaign-1',
+          fileName: 'recipients.csv',
+          filePath: '/tmp/recipients.csv',
+          totalRows: 100,
+          processedRows: 10,
+          errorRows: 2,
+          checkpointRow: 10,
+          errors: null,
+          reportUrl: null,
+          status: 'cancelled',
+          startedAt: null,
+          completedAt: new Date(),
+          cancelledAt: new Date(),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+
+      const result = await service.cancelJob('import-job-1');
+
+      expect(queuedJob.remove).toHaveBeenCalled();
       expect(prismaService.importJob.update).toHaveBeenCalledWith({
         where: { id: 'import-job-1' },
-        data: { status: 'processing' },
+        data: {
+          status: 'cancelled',
+          cancelledAt: expect.any(Date),
+          completedAt: expect.any(Date),
+        },
       });
+      expect(result.status).toBe('cancelled');
+    });
+
+    it('should requeue processing jobs with a stored file path on startup', async () => {
+      (prismaService.importJob.findMany as jest.Mock).mockResolvedValue([
+        {
+          id: 'import-job-1',
+          campaignId: 'campaign-1',
+          fileName: 'recipients.csv',
+          filePath: '/tmp/recipients.csv',
+          totalRows: 100,
+        },
+      ]);
+
+      await service.resumeInterruptedJobs();
+
+      expect(mockQueue.add).toHaveBeenCalledWith(
+        'process-import',
+        {
+          jobId: 'import-job-1',
+          campaignId: 'campaign-1',
+          fileName: 'recipients.csv',
+          filePath: '/tmp/recipients.csv',
+          totalRows: 100,
+        },
+        { jobId: 'import-job-1' },
+      );
     });
   });
 
@@ -334,7 +463,7 @@ describe('RecipientImportService', () => {
       (prismaService.importJob.findUnique as jest.Mock).mockResolvedValue(null);
 
       await expect(service.generateReportCsv('non-existent')).rejects.toThrow(
-        NotFoundException,
+        AppException,
       );
     });
   });

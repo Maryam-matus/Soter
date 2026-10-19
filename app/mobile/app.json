@@ -17,7 +17,9 @@
       "bundleIdentifier": "org.pulsefy.soter.mobile",
       "supportsTablet": true,
       "infoPlist": {
-        "UIBackgroundModes": ["remote-notification"]
+        "UIBackgroundModes": [
+          "remote-notification"
+        ]
       }
     },
     "android": {
@@ -36,7 +38,7 @@
       [
         "expo-notifications",
         {
-          "icon": "./assets/notification-icon.png",
+          "icon": "./assets/icon.png",
           "color": "#1E90FF",
           "sounds": []
         }
@@ -48,7 +50,16 @@
           "project": "mobile",
           "authToken": "SENTRY_AUTH_TOKEN"
         }
-      ]
+      ],
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "networkInspector": false
+          }
+        }
+      ],
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true,

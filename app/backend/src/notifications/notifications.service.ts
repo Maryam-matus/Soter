@@ -1,4 +1,5 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { AppException, ERROR_CODES } from '../common/dto/error-response.dto';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import {
@@ -13,6 +14,14 @@ import {
 } from './interfaces/notification-job.interface';
 import { PrismaService } from '../prisma/prisma.service';
 import { LoggerService } from '../logger/logger.service';
+import { AuditService } from '../audit/audit.service';
+import { MetricsService } from '../observability/metrics/metrics.service';
+import {
+  NotificationBackpressureService,
+  NOTIFICATION_MAX_ATTEMPTS,
+  NotificationProvider,
+  providerForType,
+} from './notification-backpressure.service';
 
 export interface ActivityFeedItem {
   id: string;
@@ -36,7 +45,35 @@ export class NotificationsService {
     @InjectQueue('notifications') private readonly notificationsQueue: Queue,
     private readonly prisma: PrismaService,
     private readonly loggerService: LoggerService,
+    private readonly backpressure: NotificationBackpressureService,
+    @Optional() private readonly auditService?: AuditService,
+    @Optional() private readonly metricsService?: MetricsService,
   ) {}
+
+  /**
+   * Options for a notification job (issue #1180).
+   *
+   * - `attempts` spans several circuit-breaker probe windows, so a
+   *   notification survives a provider outage instead of dead-lettering
+   *   seconds into it.
+   * - `backoff.type: 'custom'` routes every retry through the notification
+   *   backoff strategy, which escalates with both the attempt number and the
+   *   run of consecutive provider failures.
+   * - `delay` parks a freshly enqueued notification until the next probe
+   *   window while the circuit is cut off, so new sends queue up instead of
+   *   joining the outage.
+   */
+  private jobOptions(provider: NotificationProvider) {
+    const initialDelay = this.backpressure.getInitialDelay(provider);
+    return {
+      attempts: NOTIFICATION_MAX_ATTEMPTS,
+      backoff: {
+        type: 'custom' as const,
+        delay: this.backpressure.baseDelayMs,
+      },
+      ...(initialDelay > 0 ? { delay: initialDelay } : {}),
+    };
+  }
 
   async sendEmail(
     recipient: string,
@@ -69,13 +106,11 @@ export class NotificationsService {
       correlationId: propagatedCorrelationId,
     };
 
-    const job = await this.notificationsQueue.add('send-email', data, {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 5000,
-      },
-    });
+    const job = await this.notificationsQueue.add(
+      'send-email',
+      data,
+      this.jobOptions(providerForType(NotificationType.EMAIL)),
+    );
 
     // 3. Update outbox record to enqueued with the BullMQ job ID
     await this.prisma.notificationOutbox.update({
@@ -123,13 +158,11 @@ export class NotificationsService {
       correlationId: propagatedCorrelationId,
     };
 
-    const job = await this.notificationsQueue.add('send-sms', data, {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 5000,
-      },
-    });
+    const job = await this.notificationsQueue.add(
+      'send-sms',
+      data,
+      this.jobOptions(providerForType(NotificationType.SMS)),
+    );
 
     // 3. Update outbox record to enqueued with the BullMQ job ID
     await this.prisma.notificationOutbox.update({
@@ -194,7 +227,8 @@ export class NotificationsService {
     } = {};
 
     if (filters.outcome) where.outcome = filters.outcome;
-    if (filters.failureCategory) where.failureCategory = filters.failureCategory;
+    if (filters.failureCategory)
+      where.failureCategory = filters.failureCategory;
     if (filters.type) where.outbox = { type: filters.type };
     if (filters.from || filters.to) {
       where.startedAt = {
@@ -229,6 +263,123 @@ export class NotificationsService {
       },
       orderBy: { scheduledFor: 'asc' },
     });
+  }
+
+  async getDeadLetterNotifications(page = 1, limit = 50) {
+    const take = Math.min(Math.max(limit, 1), 200);
+    const currentPage = Math.max(page, 1);
+    const skip = (currentPage - 1) * take;
+    const where = { status: 'dead_letter' as const };
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.notificationOutbox.findMany({
+        where,
+        orderBy: { updatedAt: 'desc' },
+        skip,
+        take,
+      }),
+      this.prisma.notificationOutbox.count({ where }),
+    ]);
+    return { items, total, page: currentPage, limit: take };
+  }
+
+  async replayDeadLetterNotification(id: string, actorId: string) {
+    const record = await this.prisma.notificationOutbox.findUnique({
+      where: { id },
+    });
+    if (!record)
+      throw new AppException(
+        ERROR_CODES.NOT_FOUND,
+        404,
+        `Outbox record with id "${id}" not found`,
+      );
+    if (record.status !== 'dead_letter') {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Only dead-lettered notifications can be replayed',
+      );
+    }
+
+    const claimed = await this.prisma.notificationOutbox.updateMany({
+      where: { id, status: 'dead_letter' },
+      data: {
+        status: 'enqueued',
+        retryCount: { increment: 1 },
+        lastError: null,
+      },
+    });
+    if (claimed.count !== 1) {
+      throw new AppException(
+        ERROR_CODES.BAD_REQUEST,
+        400,
+        'Notification replay is already in progress',
+      );
+    }
+
+    const jobName =
+      (record.type as NotificationType) === NotificationType.SMS
+        ? 'send-sms'
+        : 'send-email';
+    try {
+      const job = await this.notificationsQueue.add(
+        jobName,
+        {
+          type: record.type as NotificationType,
+          recipient: record.recipient,
+          ...(record.subject ? { subject: record.subject } : {}),
+          message: record.message,
+          timestamp: Date.now(),
+          outboxId: record.id,
+          correlationId:
+            typeof this.parseMetadata(record.metadata).correlationId ===
+            'string'
+              ? (this.parseMetadata(record.metadata).correlationId as string)
+              : undefined,
+        } satisfies NotificationJobData,
+        this.jobOptions(providerForType(record.type)),
+      );
+      await this.prisma.notificationOutbox.update({
+        where: { id },
+        data: { jobId: String(job.id) },
+      });
+      await this.auditService?.record({
+        actorId,
+        entity: 'NotificationOutbox',
+        entityId: id,
+        action: 'replay_notification_dead_letter',
+        metadata: { jobId: String(job.id), type: record.type },
+      });
+      await this.refreshDeadLetterDepth();
+      return { success: true, outboxId: id, replayedJobId: String(job.id) };
+    } catch (error) {
+      await this.prisma.notificationOutbox.update({
+        where: { id },
+        data: {
+          status: 'dead_letter',
+          lastError: error instanceof Error ? error.message : String(error),
+        },
+      });
+      throw error;
+    }
+  }
+
+  async replayDeadLetterNotifications(ids: string[], actorId: string) {
+    const results = await Promise.allSettled(
+      ids.map(id => this.replayDeadLetterNotification(id, actorId)),
+    );
+    return {
+      replayed: results.filter(result => result.status === 'fulfilled').length,
+      skipped: results.filter(result => result.status === 'rejected').length,
+      results,
+    };
+  }
+
+  private async refreshDeadLetterDepth() {
+    if (!this.metricsService) return;
+    const depth = await this.prisma.notificationOutbox.count({
+      where: { status: 'dead_letter' },
+    });
+    this.metricsService.setNotificationDeadLetterDepth(depth);
   }
 
   async getActivityFeed(limit = 30): Promise<ActivityFeedItem[]> {
